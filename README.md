@@ -15,6 +15,8 @@ This is an Arduino Library which can be found in the Arduino IDE Library Manager
 | Bookoo | Themis Ultra  | ----                 | ----   | Great | Yes | Yes | Yes 
 | Felicita | Arc   | ----                       | ----   | ---- | Yes | Yes | Yes 
 
+Note on the Lunar USB-C (2021): its BLE module (Microchip BM70) splits scale messages across BLE notifications at arbitrary boundaries. Older versions of this library dropped any weight message that didn't arrive in a single aligned notification. That caused missed weights, the shotStopper "latched" beep not firing, and spurious disconnects. "New"-protocol scales are now parsed as a reassembled byte stream, and commands sent back-to-back (e.g. reset timer / start timer / tare) are spaced `CMD_SPACING_MS` apart so the scale doesn't drop them.
+
 
 ## Requirements
 This library is intended to be used with any arduino device which is compatible with the [ArduinoBLE](https://www.arduino.cc/reference/en/libraries/arduinoble/) library.

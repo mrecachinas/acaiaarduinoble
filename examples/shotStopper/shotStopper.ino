@@ -199,6 +199,7 @@ void setBrewingState(bool brewing){
     shot.start_timestamp_s = seconds_f();
     shot.shotTimer = 0;
     shot.datapoints = 0;
+    shot.expected_end_s = MAX_SHOT_DURATION_S; // don't reuse the previous shot's prediction
     if (CAN_TARE_START_TIMER && AUTOTARE) {
       scale.tareStartTimer();
     } else {
@@ -280,6 +281,10 @@ void calculateEndTime(Shot* s){
 
 float seconds_f(){
   return millis()/1000.0;
+}
+
+float shotElapsed_s(){
+  return seconds_f() - shot.start_timestamp_s;
 }
 
 void setColor(int rgb[3]){
@@ -382,11 +387,13 @@ void scaleConnected_task(){
   }
     
   // button held. Take over for the rest of the shot.
+  // Uses elapsed wall-clock time rather than shot.shotTimer (which only advances
+  // when a weight packet arrives) so a gap in scale data can't block the latch.
   else if(!TIMER_ONLY
   && !MOMENTARY 
   && shot.brewing 
   && !buttonLatched 
-  && (shot.shotTimer > MIN_SHOT_DURATION_S) 
+  && (shotElapsed_s() > MIN_SHOT_DURATION_S) 
   ){
     buttonLatched = true;
     Serial.println("Button Latched");
@@ -416,7 +423,7 @@ void scaleConnected_task(){
   //Max duration reached
   else if(!TIMER_ONLY 
   && shot.brewing 
-  && shot.shotTimer > MAX_SHOT_DURATION_S ){
+  && shotElapsed_s() > MAX_SHOT_DURATION_S ){
     shot.brewing = false;
     Serial.println("Max brew duration reached");
     shot.end = ENDTYPE::TIME;
