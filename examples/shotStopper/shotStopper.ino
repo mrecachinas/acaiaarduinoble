@@ -32,6 +32,7 @@
                                     // looses control of the paddle once the system
                                     // latches.
 #define BUTTON_READ_PERIOD_MS 5
+#define WEIGHT_FRESH_MS       1000  // Maximum weight age when taking over a latching paddle
 #define DRIP_DELAY_S          3     // Time after the shot ended to measure the final weight
 
 #define EEPROM_SIZE 2  // This is 1-Byte
@@ -63,7 +64,7 @@
   #define IN          21
   #define OUT         38
   #define REED_IN     18
-#elifdef ARDUINO_ESP32C3_DEV
+#elif defined(ARDUINO_ESP32C3_DEV)
   #define LED_RED     21
   #define LED_BLUE    10
   #define LED_GREEN   20
@@ -94,6 +95,9 @@ int currentColor[3] = {0,0,0};
 
 AcaiaArduinoBLE scale(DEBUG);
 static unsigned long lastConnectAttempt = 0;
+unsigned long lastWeight_ms = 0;
+bool hasWeight = false;
+bool warnedStaleWeight = false;
 float currentWeight = 0;
 uint8_t goalWeight = 0;      // Goal Weight to be read from EEPROM
 float weightOffset = 0;
@@ -104,6 +108,7 @@ int buttonArr[BUTTON_STATE_ARRAY_LENGTH];            // last 4 readings of the b
 int in = REEDSWITCH ? REED_IN : IN;
 bool buttonPressed = false; //physical status of button
 bool buttonLatched = false; //electrical status of button
+bool waitingForPaddleRelease = false;
 unsigned long lastButtonRead_ms = 0;
 int newButtonState = 0;
 
@@ -173,23 +178,29 @@ void setup() {
 
 void loop() {
 
-  // Attempt to connect to scale every 1 seconds
-  if(!scale.isConnected() & millis() - lastConnectAttempt >= 1000){
+  if(scale.isConnected()){
+    scaleConnected_task();
+  }
+
+  if(!scale.isConnected()){
+    lastWeight_ms = 0;
+    hasWeight = false;
+    if(shot.brewing){
+      shot.brewing = false;
+      shot.end = ENDTYPE::DISCONNECT;
+      setBrewingState(false);
+    }
+
+    // Release the machine before any potentially blocking reconnect attempt.
+    if(millis() - lastConnectAttempt >= 1000){
       lastConnectAttempt = millis();
       setColor(RED);
       scale.init(); 
       currentWeight = 0;
-      if(shot.brewing){
-        shot.brewing = false;
-        shot.end = ENDTYPE::DISCONNECT;
-        setBrewingState(false);
-      }
       if(scale.isConnected()){
         setColor(YELLOW);
       }
-  }
-  else if(scale.isConnected()){
-    scaleConnected_task();
+    }
   }
 }
 
@@ -200,6 +211,7 @@ void setBrewingState(bool brewing){
     shot.shotTimer = 0;
     shot.datapoints = 0;
     shot.expected_end_s = MAX_SHOT_DURATION_S; // don't reuse the previous shot's prediction
+    warnedStaleWeight = false;
     if (CAN_TARE_START_TIMER && AUTOTARE) {
       scale.tareStartTimer();
     } else {
@@ -211,6 +223,29 @@ void setBrewingState(bool brewing){
     }
     Serial.println("Weight Timer End");
   }else{
+    bool waitForRelease = !TIMER_ONLY && !MOMENTARY && !buttonLatched
+                      && (shot.end == ENDTYPE::TIME || shot.end == ENDTYPE::WEIGHT);
+    if(waitForRelease){
+      waitingForPaddleRelease = true;
+    }
+    shot.end_s = seconds_f() - shot.start_timestamp_s;
+    if(!TIMER_ONLY
+    && MOMENTARY
+    && (ENDTYPE::WEIGHT == shot.end || ENDTYPE::TIME == shot.end)){
+      digitalWrite(OUT,HIGH);Serial.println("wrote high");
+      delay(300);
+      digitalWrite(OUT,LOW);Serial.println("wrote low");
+      buttonPressed = false;
+    }else if(!TIMER_ONLY && !MOMENTARY){
+      buttonLatched = false;
+      buttonPressed = false;
+      digitalWrite(OUT,LOW); Serial.println("wrote low");
+      Serial.println("Button Unlatched and not pressed");
+    }
+
+    if(waitForRelease){
+      Serial.println("waiting for paddle release before next shot");
+    }
     Serial.print("ShotEnded by ");
     switch (shot.end) {
       case ENDTYPE::TIME:
@@ -230,21 +265,8 @@ void setBrewingState(bool brewing){
         break;
     }
 
-    shot.end_s = seconds_f() - shot.start_timestamp_s;
-    scale.stopTimer();
-    if(!TIMER_ONLY 
-    && MOMENTARY 
-    && (ENDTYPE::WEIGHT == shot.end || ENDTYPE::TIME == shot.end)){
-      //Pulse button to stop brewing
-      digitalWrite(OUT,HIGH);Serial.println("wrote high");
-      delay(300);
-      digitalWrite(OUT,LOW);Serial.println("wrote low");
-      buttonPressed = false;
-    }else if(!TIMER_ONLY && !MOMENTARY){
-      buttonLatched = false;
-      buttonPressed = false;
-      Serial.println("Button Unlatched and not pressed");
-      digitalWrite(OUT,LOW); Serial.println("wrote low");
+    if(scale.isConnected()){
+      scale.stopTimer();
     }
   } 
 
@@ -318,6 +340,8 @@ void scaleConnected_task(){
   // otherwise getWeight() will return stale data
   if(scale.newWeightAvailable()){
     currentWeight = scale.getWeight();
+    lastWeight_ms = millis();
+    hasWeight = true;
 
     Serial.print(currentWeight);
 
@@ -343,6 +367,10 @@ void scaleConnected_task(){
     Serial.println();
   }
 
+  if(!scale.isConnected()){
+    return; // loop() releases the machine before reconnecting
+  }
+
   // Read button every period
   if(millis() > (lastButtonRead_ms + BUTTON_READ_PERIOD_MS) ){
     lastButtonRead_ms = millis();
@@ -366,6 +394,11 @@ void scaleConnected_task(){
     }
     //Serial.println();
 
+    // Only real debounced input can re-arm; the reed ignore window is synthetic.
+    if(!newButtonState){
+      waitingForPaddleRelease = false;
+    }
+
     //The reed switch measurements require a small amount of delay for accuracy.
     //  if the shot just stopped, assume that the reed switch should read "open" for the first 0.5s
     if(REEDSWITCH && !shot.brewing && seconds_f() < (shot.start_timestamp_s + shot.end_s + 1)){
@@ -374,10 +407,18 @@ void scaleConnected_task(){
     }
   }
 
+  bool weightFresh = hasWeight && millis() - lastWeight_ms <= WEIGHT_FRESH_MS;
+  if(!TIMER_ONLY && !MOMENTARY && shot.brewing && !buttonLatched
+  && newButtonState && shotElapsed_s() > MIN_SHOT_DURATION_S
+  && !weightFresh && !warnedStaleWeight){
+    Serial.println("no fresh scale data, not taking over, paddle stays in control");
+    warnedStaleWeight = true;
+  }
+
   // SHOT INITIATION EVENTS --------------------------------
   
   //button just pressed (and released)
-  if(newButtonState && buttonPressed == false ){
+  if(newButtonState && buttonPressed == false && !waitingForPaddleRelease){
     Serial.println("ButtonPressed");
     buttonPressed = true;
     if(!MOMENTARY || REEDSWITCH){
@@ -387,13 +428,15 @@ void scaleConnected_task(){
   }
     
   // button held. Take over for the rest of the shot.
-  // Uses elapsed wall-clock time rather than shot.shotTimer (which only advances
-  // when a weight packet arrives) so a gap in scale data can't block the latch.
+  // Keep elapsed timing independent of packets, but only take over with fresh data.
   else if(!TIMER_ONLY
   && !MOMENTARY 
   && shot.brewing 
   && !buttonLatched 
-  && (shotElapsed_s() > MIN_SHOT_DURATION_S) 
+  && newButtonState
+  && weightFresh
+  && (shotElapsed_s() > MIN_SHOT_DURATION_S)
+  && (shotElapsed_s() <= MAX_SHOT_DURATION_S)
   ){
     buttonLatched = true;
     Serial.println("Button Latched");

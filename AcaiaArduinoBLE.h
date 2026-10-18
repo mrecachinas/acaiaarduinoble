@@ -24,8 +24,7 @@
 #define READ_CHAR_FELICITA     "ffe1"   //   notify (weight) and write (commands)
 #define HEARTBEAT_PERIOD_MS     2750
 #define MAX_PACKET_PERIOD_MS    5000
-#define CMD_SPACING_MS          100     // Minimum gap between commands sent to an Acaia scale.
-                                        //  Lunar 2021 intermittently drops back-to-back commands.
+#define CMD_SPACING_MS          100     // Protective minimum gap between Acaia commands.
 #define RX_BUFFER_SIZE          128     // Reassembly buffer for the Acaia (NEW) notification stream
 #define MAX_FRAME_LENGTH        40      // Larger "EF DD" frames are treated as corrupt
 
@@ -79,7 +78,9 @@ class AcaiaArduinoBLE{
         scale_type          _type;
         bool                _debug; 
         long                _packetPeriod;
-        long                _lastPacket;
+        unsigned long       _lastPacket;
+        unsigned long       _connectedAt;
+        bool                _hasWeight;
         unsigned long       _lastWrite;
         uint8_t             _rxBuf[RX_BUFFER_SIZE];
         int                 _rxLen;

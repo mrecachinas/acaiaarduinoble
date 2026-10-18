@@ -57,6 +57,10 @@ AcaiaArduinoBLE::AcaiaArduinoBLE(bool debug){
     _currentWeight = 0;
     _connected = false;
     _packetPeriod = 0;
+    _lastHeartBeat = 0;
+    _lastPacket = 0;
+    _connectedAt = 0;
+    _hasWeight = false;
     _lastWrite = 0;
     _rxLen = 0;
 }
@@ -69,6 +73,7 @@ bool AcaiaArduinoBLE::init(String mac){
 
     unsigned long start = millis();
     _lastPacket = 0;
+    _hasWeight = false;
 
     if (mac == ""){
         BLE.scan();
@@ -202,6 +207,7 @@ bool AcaiaArduinoBLE::init(String mac){
                 }
             }
             _connected = true;
+            _connectedAt = millis();
             _packetPeriod = 0;
             return true;
         }
@@ -334,14 +340,7 @@ bool AcaiaArduinoBLE::isConnected(){
 bool AcaiaArduinoBLE::newWeightAvailable(){
     bool newWeightPacket = false;
 
-    //check how long its been since we last got a response
-    if(_lastPacket && millis()-_lastPacket > MAX_PACKET_PERIOD_MS){
-        Serial.println("timeout!");
-        //reset connection
-        _connected = false;
-        BLE.disconnect();
-        return false;
-    }else if(NEW == _type){
+    if(NEW == _type){
         BLE.poll(); // deliver any pending notifications to onNotification()
         newWeightPacket = parseRxBuffer();
     }else if(_read.valueUpdated()){
@@ -403,17 +402,22 @@ bool AcaiaArduinoBLE::newWeightAvailable(){
     }
 
     if(newWeightPacket){
-        if(_lastPacket){
+        if(_hasWeight){
             _packetPeriod = millis() - _lastPacket;
         }
         _lastPacket = millis();
+        _hasWeight = true;
+    }else if(_connected && (_hasWeight || NEW == _type)
+          && millis() - (_hasWeight ? _lastPacket : _connectedAt) > MAX_PACKET_PERIOD_MS){
+        Serial.println(_hasWeight ? "timeout!" : "no weight since connect");
+        _connected = false;
+        BLE.disconnect();
     }
     return newWeightPacket;
 }
 
-// All writes go through here. Acaia scales get a minimum gap between commands:
-// the Lunar 2021 intermittently ignores commands that arrive back-to-back
-// (e.g. reset timer + start timer + tare at the start of a shot).
+// Space Acaia commands as a precaution against back-to-back command loss.
+// This timing has not been established as the cause of intermittent missing beeps.
 bool AcaiaArduinoBLE::writeCommand(const byte* data, int length, bool withResponse){
     if(_type == OLD || _type == NEW){
         while(millis() - _lastWrite < CMD_SPACING_MS){
@@ -482,6 +486,22 @@ bool AcaiaArduinoBLE::parseRxBuffer(){
         }
         if(_rxLen - i < frameLength){
             break; // wait for the rest of the frame
+        }
+
+        uint8_t ck1 = 0, ck2 = 0;
+        for(int k = 0; k < len; k++){
+            if(k & 1){
+                ck2 += _rxBuf[i + 3 + k];
+            }else{
+                ck1 += _rxBuf[i + 3 + k];
+            }
+        }
+        if(ck1 != _rxBuf[i + 3 + len] || ck2 != _rxBuf[i + 4 + len]){
+            if(_debug){
+                Serial.println("invalid frame checksum");
+            }
+            i += 2; // a bad length may span valid frames; search again, don't consume it
+            continue;
         }
 
         // Event message (0x0C) of type weight (0x05): payload starts at byte 5
