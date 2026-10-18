@@ -24,6 +24,9 @@
 #define READ_CHAR_FELICITA     "ffe1"   //   notify (weight) and write (commands)
 #define HEARTBEAT_PERIOD_MS     2750
 #define MAX_PACKET_PERIOD_MS    5000
+#define CMD_SPACING_MS          100     // Protective minimum gap between Acaia commands.
+#define RX_BUFFER_SIZE          128     // Reassembly buffer for the Acaia (NEW) notification stream
+#define MAX_FRAME_LENGTH        40      // Larger "EF DD" frames are treated as corrupt
 
 #include "Arduino.h"
 #include <ArduinoBLE.h>
@@ -52,6 +55,14 @@ class AcaiaArduinoBLE{
         bool newWeightAvailable();
     private:
         bool isScaleName(String);
+        bool writeCommand(const byte* data, int length, bool withResponse = false);
+
+        // Stream reassembly for NEW (Lunar 2021 / Pyxis) scales
+        static void onNotification(BLEDevice device, BLECharacteristic characteristic);
+        void appendRx(const uint8_t* data, int length);
+        bool parseRxBuffer();
+        bool decodeWeight(const uint8_t* payload);
+        static AcaiaArduinoBLE* _instance;
 
         //debug functions
         void exploreService(BLEService service);
@@ -67,7 +78,12 @@ class AcaiaArduinoBLE{
         scale_type          _type;
         bool                _debug; 
         long                _packetPeriod;
-        long                _lastPacket;
+        unsigned long       _lastPacket;
+        unsigned long       _connectedAt;
+        bool                _hasWeight;
+        unsigned long       _lastWrite;
+        uint8_t             _rxBuf[RX_BUFFER_SIZE];
+        int                 _rxLen;
 };
 
 #endif
