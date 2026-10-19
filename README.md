@@ -65,6 +65,30 @@ The following variables at the top of the shotStopper.ino file can be configured
 `TIMER_ONLY`
 * false by default. disables brew-by-weight functionality and enables only automatic timer and tare
 
+## Read-only BLE diagnostics
+
+The shotStopper example provides a read-only diagnostics service for a Mac
+Python/Bleak client, with status, recent event history, and watch commands.
+All three diagnostic characteristics are read-only; watch polls without
+notifications or CCCD writes (default 2 seconds, minimum 0.5 seconds).
+See [client setup, complete wire protocol, limitations, and offline tests](tools/README.md).
+An initial wired firmware flash is required. No OTA, Wi-Fi/cloud, or new control
+interface is provided; the existing goal characteristic/control behavior is
+unchanged. A connected scale is not necessarily producing fresh weight data,
+and command-write success does not prove scale execution.
+
+Simultaneous scale-central and debugger-peripheral BLE support is controller/
+core dependent, unproven, and may fail. **No live validation was performed.**
+Disconnecting the debugger should not deliberately drop the scale.
+The preexisting scale-timeout `BLE.disconnect()` can also drop the debugger;
+diagnostics do not introduce or change that behavior.
+
+Hardware-free validation (no Bleak dependency or BLE operations):
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+```
+
 ## Demo
 
 You can find a demo on Youtube:
@@ -100,4 +124,3 @@ Felicita Arc support contributions from baettigp and A-TWJ
 Bookoo contributions from philgood and same31
 
 lunar 2019 contributions from jniebuhr
-

@@ -23,6 +23,7 @@
 
 #include <AcaiaArduinoBLE.h>
 #include <EEPROM.h>
+#include <math.h>
 
 #define MAX_OFFSET 5                // In case an error in brewing occured
 #define MIN_SHOT_DURATION_S 3       //Useful for flushing the group.
@@ -125,6 +126,166 @@ Shot shot = {0,0,0,0,{},{},0,false,ENDTYPE::UNDEF};
 //BLE peripheral device
 BLEService weightService("0x0FFE"); // create service
 BLEByteCharacteristic weightCharacteristic("0xFF11",  BLEWrite | BLERead);
+BLEService diagnosticsService("7b183000-6e2d-4a9b-9c51-4c5344470001");
+BLECharacteristic diagnosticsStatus(
+  "7b183001-6e2d-4a9b-9c51-4c5344470001",
+  BLERead, ShotStopperDiagnostics::kStatusSize, true);
+BLECharacteristic diagnosticsMetadata(
+  "7b183002-6e2d-4a9b-9c51-4c5344470001",
+  BLERead, ShotStopperDiagnostics::kMetadataSize, true);
+BLECharacteristic diagnosticsHistory(
+  "7b183003-6e2d-4a9b-9c51-4c5344470001",
+  BLERead, ShotStopperDiagnostics::kHistorySize, true);
+static ShotStopperDiagnostics::Ring diagnosticEvents;
+static int8_t diagnosticLearningWaitState = -1;
+static bool diagnosticSaturated = false;
+
+static int32_t toDecigrams(float grams, int32_t minimum, int32_t maximum,
+                           bool* saturated = NULL) {
+  if (!isfinite(grams)) {
+    if (saturated) *saturated = true;
+    return 0;
+  }
+  double decigrams = static_cast<double>(grams) * 10.0;
+  if (decigrams > maximum) {
+    if (saturated) *saturated = true;
+    return maximum;
+  }
+  if (decigrams < minimum) {
+    if (saturated) *saturated = true;
+    return minimum;
+  }
+  return static_cast<int32_t>(round(decigrams));
+}
+
+static int16_t offsetDecigrams(bool* saturated = NULL) {
+  int32_t value = toDecigrams(weightOffset, -32768, 32767, saturated);
+  return static_cast<int16_t>(value);
+}
+
+static uint32_t currentWeightAgeMs() {
+  return scale.weightAgeMs();
+}
+
+static void appendDiagnosticEvent(uint8_t kind, uint8_t detail) {
+  const float grams = scale.hasWeightSample() ? scale.getWeight() : 0.0f;
+  int32_t value = toDecigrams(grams, INT32_MIN, INT32_MAX);
+  diagnosticEvents.append(millis(), kind, detail, offsetDecigrams(), value,
+                          currentWeightAgeMs());
+}
+
+static void onScaleDiagnostics(ShotStopperDiagnostics::EventKind event,
+                               uint8_t detail) {
+  static bool attemptRecorded = false;
+  static uint8_t lastFailureStage = 0;
+  static bool connectionReady = false;
+
+  // Preserve useful history during an outage without changing connection retries.
+  switch (event) {
+    case ShotStopperDiagnostics::kConnectionAttempt:
+      if (attemptRecorded) return;
+      attemptRecorded = true;
+      break;
+    case ShotStopperDiagnostics::kConnectionFailed:
+      if (lastFailureStage == detail) return;
+      lastFailureStage = detail;
+      break;
+    case ShotStopperDiagnostics::kConnectionReady:
+      connectionReady = true;
+      attemptRecorded = false;
+      lastFailureStage = 0;
+      break;
+    case ShotStopperDiagnostics::kDisconnected:
+      if (!connectionReady) return;
+      connectionReady = false;
+      attemptRecorded = false;
+      lastFailureStage = 0;
+      break;
+    default:
+      break;
+  }
+  appendDiagnosticEvent(static_cast<uint8_t>(event), detail);
+}
+
+static void onBleDisconnected(BLEDevice device) {
+  if (scale.isScaleDevice(device)) {
+    onScaleDiagnostics(ShotStopperDiagnostics::kDisconnected, 0);
+  }
+}
+
+static void recordCommandResult(uint8_t commandId, bool success) {
+  if (commandId == 7 && success) return;
+  appendDiagnosticEvent(ShotStopperDiagnostics::kCommandResult,
+                        static_cast<uint8_t>((commandId & 0x7f) |
+                                             (success ? 0x80 : 0)));
+}
+
+static void refreshDiagnostics() {
+  const uint32_t now = millis();
+  if (diagnosticEvents.publishDue(now)) {
+    diagnosticEvents.markPublished(now);
+    uint8_t metadata[ShotStopperDiagnostics::kMetadataSize];
+    uint8_t history[ShotStopperDiagnostics::kHistorySize];
+    ShotStopperDiagnostics::serializeMetadata(diagnosticEvents, metadata,
+                                               sizeof(metadata));
+    ShotStopperDiagnostics::serializeHistory(diagnosticEvents, history,
+                                              sizeof(history));
+    diagnosticsMetadata.writeValue(metadata, sizeof(metadata));
+    diagnosticsHistory.writeValue(history, sizeof(history));
+  }
+
+  static bool hasStatusPublication = false;
+  static uint32_t lastStatusPublicationMs = 0;
+  if (!hasStatusPublication ||
+      static_cast<uint32_t>(now - lastStatusPublicationMs) >=
+          ShotStopperDiagnostics::kPublishPeriodMs) {
+    bool saturated = false;
+    const int16_t weight = static_cast<int16_t>(
+      toDecigrams(currentWeight, -32768, 32767, &saturated));
+    const int16_t offset = offsetDecigrams(&saturated);
+    const float shotElapsedSeconds = shot.brewing
+      ? seconds_f() - shot.start_timestamp_s
+      : (shot.end_s > 0.0f ? shot.end_s : shot.shotTimer);
+    const double shotDeciseconds =
+      static_cast<double>(shotElapsedSeconds) * 10.0;
+    uint16_t elapsed = 0;
+    if (!isfinite(shotDeciseconds) || shotDeciseconds > 65535.0) {
+      elapsed = 65535;
+      saturated = true;
+    } else if (shotDeciseconds < 0.0) {
+      elapsed = 0;
+      saturated = true;
+    } else if (shotDeciseconds > 0.0) {
+      elapsed = static_cast<uint16_t>(round(shotDeciseconds));
+      if (elapsed == 65535) saturated = true;
+    }
+    diagnosticSaturated = saturated;
+
+    ShotStopperDiagnostics::Status status;
+    status.flags = 0;
+    if (scale.isConnected()) status.flags |= ShotStopperDiagnostics::kScaleConnected;
+    if (scale.hasWeightSample()) status.flags |= ShotStopperDiagnostics::kWeightValid;
+    if (shot.brewing) status.flags |= ShotStopperDiagnostics::kBrewing;
+    if (buttonLatched) status.flags |= ShotStopperDiagnostics::kLatched;
+    if (buttonPressed) status.flags |= ShotStopperDiagnostics::kButtonPressed;
+    if (!TIMER_ONLY && shot.start_timestamp_s && shot.end_s) {
+      status.flags |= ShotStopperDiagnostics::kLearningPending;
+    }
+    if (diagnosticSaturated) status.flags |= ShotStopperDiagnostics::kSaturated;
+    status.uptimeMs = now;
+    status.weightDecigrams = weight;
+    status.targetDecigrams = static_cast<uint16_t>(goalWeight) * 10;
+    status.actualOffsetDecigrams = offset;
+    status.weightAgeMs = currentWeightAgeMs();
+    status.shotElapsedDeciseconds = elapsed;
+
+    uint8_t data[ShotStopperDiagnostics::kStatusSize];
+    ShotStopperDiagnostics::serializeStatus(status, data, sizeof(data));
+    diagnosticsStatus.writeValue(data, sizeof(data));
+    lastStatusPublicationMs = now;
+    hasStatusPublication = true;
+  }
+}
 
 void setup() {
   setCpuFrequencyMhz(80);
@@ -137,7 +298,7 @@ void setup() {
   Serial.print("Goal Weight retrieved: ");
   Serial.println(goalWeight);
   Serial.print("offset retrieved: ");
-  Serial.println(goalWeight);
+  Serial.println(weightOffset);
 
   //If eeprom isn't initialized and has an 
   // unreasonable weight/offset, default to 36g/1.5g
@@ -162,11 +323,19 @@ void setup() {
 
   // initialize the BLE hardware
   BLE.begin();
+  BLE.setEventHandler(BLEDisconnected, onBleDisconnected);
   BLE.setLocalName("shotStopper");
   BLE.setAdvertisedService(weightService);
   weightService.addCharacteristic(weightCharacteristic);
   BLE.addService(weightService);
   weightCharacteristic.writeValue(goalWeight);
+  diagnosticsService.addCharacteristic(diagnosticsStatus);
+  diagnosticsService.addCharacteristic(diagnosticsMetadata);
+  diagnosticsService.addCharacteristic(diagnosticsHistory);
+  BLE.addService(diagnosticsService);
+  scale.setDiagnosticsCallback(onScaleDiagnostics);
+  appendDiagnosticEvent(ShotStopperDiagnostics::kBoot, 0);
+  refreshDiagnostics();
   BLE.advertise();
   Serial.println("Bluetooth® device active, waiting for connections...");
 }
@@ -191,21 +360,23 @@ void loop() {
   else if(scale.isConnected()){
     scaleConnected_task();
   }
+  refreshDiagnostics();
 }
 
 void setBrewingState(bool brewing){
   if(brewing){
+    appendDiagnosticEvent(ShotStopperDiagnostics::kShotStart, 0);
     Serial.println("shot started");
     shot.start_timestamp_s = seconds_f();
     shot.shotTimer = 0;
     shot.datapoints = 0;
     if (CAN_TARE_START_TIMER && AUTOTARE) {
-      scale.tareStartTimer();
+      recordCommandResult(5, scale.tareStartTimer());
     } else {
-      scale.resetTimer();
-      scale.startTimer();
+      recordCommandResult(4, scale.resetTimer());
+      recordCommandResult(2, scale.startTimer());
       if(AUTOTARE){
-        scale.tare();
+        recordCommandResult(1, scale.tare());
       }
     }
     Serial.println("Weight Timer End");
@@ -230,7 +401,9 @@ void setBrewingState(bool brewing){
     }
 
     shot.end_s = seconds_f() - shot.start_timestamp_s;
-    scale.stopTimer();
+    appendDiagnosticEvent(ShotStopperDiagnostics::kShotEnd,
+                          static_cast<uint8_t>(shot.end));
+    recordCommandResult(3, scale.stopTimer());
     if(!TIMER_ONLY 
     && MOMENTARY 
     && (ENDTYPE::WEIGHT == shot.end || ENDTYPE::TIME == shot.end)){
@@ -240,6 +413,9 @@ void setBrewingState(bool brewing){
       digitalWrite(OUT,LOW);Serial.println("wrote low");
       buttonPressed = false;
     }else if(!TIMER_ONLY && !MOMENTARY){
+      if(buttonLatched){
+        appendDiagnosticEvent(ShotStopperDiagnostics::kLatch, 0);
+      }
       buttonLatched = false;
       buttonPressed = false;
       Serial.println("Button Unlatched and not pressed");
@@ -306,7 +482,7 @@ void scaleConnected_task(){
 
   // Send a heartbeat message to the scale periodically to maintain connection
   if(scale.heartbeatRequired()){
-    scale.heartbeat();
+    recordCommandResult(7, scale.heartbeat());
   }
 
   // always call newWeightAvailable to actually receive the datapoint from the scale,
@@ -389,11 +565,12 @@ void scaleConnected_task(){
   && (shot.shotTimer > MIN_SHOT_DURATION_S) 
   ){
     buttonLatched = true;
+    appendDiagnosticEvent(ShotStopperDiagnostics::kLatch, 1);
     Serial.println("Button Latched");
     digitalWrite(OUT,HIGH); Serial.println("wrote high");
     // Get the scale to beep to inform user.
     if(AUTOTARE){
-      scale.beep();
+      recordCommandResult(6, scale.beep());
     }
   }
 
@@ -460,6 +637,7 @@ void scaleConnected_task(){
 
     if( abs(currentWeight - goalWeight + weightOffset) > MAX_OFFSET ){
       Serial.print("g. Error assumed. Offset unchanged. ");
+      appendDiagnosticEvent(ShotStopperDiagnostics::kLearningRejected, 0);
     }
     else{
       Serial.print("g. Next time I'll create an offset of ");
@@ -468,7 +646,23 @@ void scaleConnected_task(){
 
       EEPROM.write(OFFSET_ADDR, weightOffset*10); //1 byte, 0-255
       EEPROM.commit();
+      appendDiagnosticEvent(ShotStopperDiagnostics::kLearningUpdate, 0);
     }
     Serial.println();
+    diagnosticLearningWaitState = -1;
+  }
+
+  if(!TIMER_ONLY && shot.start_timestamp_s && shot.end_s){
+    const bool waitingForDrips =
+      seconds_f() <= shot.start_timestamp_s + shot.end_s + DRIP_DELAY_S;
+    const int8_t waitState = waitingForDrips
+      ? 0 : (currentWeight < (goalWeight - weightOffset) ? 1 : -1);
+    if(waitState >= 0 && waitState != diagnosticLearningWaitState){
+      appendDiagnosticEvent(ShotStopperDiagnostics::kLearningWait,
+                            static_cast<uint8_t>(waitState));
+    }
+    diagnosticLearningWaitState = waitState;
+  }else{
+    diagnosticLearningWaitState = -1;
   }
 }
