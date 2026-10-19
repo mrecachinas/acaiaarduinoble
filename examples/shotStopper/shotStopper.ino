@@ -176,12 +176,40 @@ static void appendDiagnosticEvent(uint8_t kind, uint8_t detail) {
 
 static void onScaleDiagnostics(ShotStopperDiagnostics::EventKind event,
                                uint8_t detail) {
+  static bool attemptRecorded = false;
+  static uint8_t lastFailureStage = 0;
+  static bool connectionReady = false;
+
+  // Preserve useful history during an outage without changing connection retries.
+  switch (event) {
+    case ShotStopperDiagnostics::kConnectionAttempt:
+      if (attemptRecorded) return;
+      attemptRecorded = true;
+      break;
+    case ShotStopperDiagnostics::kConnectionFailed:
+      if (lastFailureStage == detail) return;
+      lastFailureStage = detail;
+      break;
+    case ShotStopperDiagnostics::kConnectionReady:
+      connectionReady = true;
+      attemptRecorded = false;
+      lastFailureStage = 0;
+      break;
+    case ShotStopperDiagnostics::kDisconnected:
+      if (!connectionReady) return;
+      connectionReady = false;
+      attemptRecorded = false;
+      lastFailureStage = 0;
+      break;
+    default:
+      break;
+  }
   appendDiagnosticEvent(static_cast<uint8_t>(event), detail);
 }
 
 static void onBleDisconnected(BLEDevice device) {
   if (scale.isScaleDevice(device)) {
-    appendDiagnosticEvent(ShotStopperDiagnostics::kDisconnected, 0);
+    onScaleDiagnostics(ShotStopperDiagnostics::kDisconnected, 0);
   }
 }
 

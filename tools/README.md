@@ -46,7 +46,10 @@ Snapshot retries remain bounded as described below.
 
 `watch` exits on disconnect by default. Opt in to bounded reconnects using
 `--reconnects 2 --reconnect-delay 5`. Each attempt rediscovers the named device
-and verifies the service; neither its Mac identifier nor a sequence number
+and verifies the service. A discovery window with no matching device consumes
+an attempt and retries after the same delay while attempts remain. Multiple
+matching devices and protocol errors are fatal, not retried. Neither a Mac
+identifier nor a sequence number
 guarantees persistent device/boot identity. Every connection flags history
 replay and discards the old cursor. Full retained snapshots may be repeated.
 Within a connection, modular cursor comparison reports an overrun/reset/gap
@@ -150,10 +153,16 @@ There is no application paging command. The entire 496-byte value is read via
 the backend's normal ATT long-read support; MTU/read fragmentation and updates
 can produce a torn snapshot. Client reads metadata → history → metadata,
 requires both metadata values to match in full, requires the history header to
-match, validates contiguous modular slot sequences and zero unused padding,
-and retries at most `--retries` times (default 3, maximum 10). Exhaustion is an
-explicit protocol error, not partial success. Unknown version/type/event,
-reserved flags, invalid lengths/count/capacity/detail/ranges/padding are errors.
+match, and validates contiguous modular slot sequences and zero unused padding.
+Changed metadata causes a retry, up to `--retries` total attempts (default 3,
+maximum 10). If every attempt races a publication, one-shot `history` fails
+explicitly; `watch` emits `snapshot_inconsistent` with an error, still reports
+status with elapsed read latency, and waits the normal poll interval before
+trying again. No partial events are returned, and the history cursor does not
+advance on failed snapshots, so later gaps remain visible.
+Malformed metadata or an invalid history under unchanged metadata is a fatal
+protocol error, not a recoverable race: unknown version/type/event, reserved
+flags, invalid lengths/count/capacity/detail/ranges/padding remain errors.
 No snapshot or cursor algorithm can prove continuity after an entire counter
 wrap, reboot, or device replacement.
 
@@ -175,6 +184,18 @@ wrap, reboot, or device replacement.
 | 12 | learning_update | 0 |
 | 13 | boot | 0 |
 
+Connection events describe transitions, not every periodic retry. An outage
+retains its first `connection_attempt` and `connection_failed`; further attempts
+and repeated failures at the same stage are coalesced. A changed failure stage
+and successful `connection_ready` are still recorded. After a ready connection,
+only the first disconnect observation (physical or host failure) is recorded
+until the next ready connection. Later timeout and command-result events remain
+available without falsely implying additional disconnects. These filters affect
+only history: they never change scale commands, retry timing, or connection state.
+Coalesced retries do not consume sequence numbers or increment the overwritten
+count, and the history is not a retry counter. An unchanged outage therefore
+does not continually overwrite earlier shot events or republish history.
+
 Firmware refreshes local characteristic values at most 2 Hz; history is
 serialized/refreshed only when dirty. Valid initial values are populated before
 advertising. Reads may therefore lag an event. This is diagnostic telemetry, not a
@@ -193,6 +214,9 @@ compiler is available (native test skips explicitly if unavailable). They check
 wire bytes, ring limits, snapshots, rollover, malformed packets, stale state,
 read-only properties, absence of subscriptions/writes, polling cadence and
 read latency, reconnect/replay, and CLI errors.
+Regression cases cover temporary discovery misses, bounded reconnect exhaustion,
+snapshot races followed by recovery, fatal malformed snapshots, and retained
+shot history through an hour of simulated identical connection failures.
 The native sketch harness includes the actual `.ino` and real library header,
 then substitutes only Arduino GPIO/time, EEPROM, BLE transport recording, and
 scale method boundaries. It executes real `setup`, `refreshDiagnostics`, and

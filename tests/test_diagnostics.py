@@ -249,24 +249,83 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(events), 2)
         self.assertEqual(len(client.calls), 6)
 
-    async def test_snapshot_bounded_error(self):
+    async def test_malformed_snapshot_is_fatal(self):
         meta, history = snapshot()
-        client = FakeClient(reads=[(d.METADATA, meta), (d.HISTORY, history[:-1]), (d.METADATA, meta)] * 2)
-        with self.assertRaisesRegex(d.ProtocolError, "after 2 attempts"):
+        client = FakeClient(reads=[(d.METADATA, meta), (d.HISTORY, history[:-1]), (d.METADATA, meta)])
+        with self.assertRaisesRegex(d.ProtocolError, "expected 496 bytes"):
             await d.read_snapshot(client, 2)
-        self.assertEqual(len(client.calls), 6)
+        self.assertEqual(len(client.calls), 3)
 
-    async def test_header_and_slot_changes_retry(self):
+    async def test_stable_metadata_with_invalid_header_or_slots_is_fatal(self):
         meta, history = snapshot()
         for index in (4, 16, 56):
             bad = bytearray(history)
             bad[index] ^= 1
             client = FakeClient(reads=[
-                (d.METADATA, meta), (d.HISTORY, bad), (d.METADATA, meta),
-                (d.METADATA, meta), (d.HISTORY, history), (d.METADATA, meta)])
-            _, events = await d.read_snapshot(client, 2)
-            self.assertEqual(len(events), 2)
-            self.assertEqual(len(client.calls), 6)
+                (d.METADATA, meta), (d.HISTORY, bad), (d.METADATA, meta)])
+            with self.subTest(index=index), self.assertRaises(d.ProtocolError):
+                await d.read_snapshot(client, 2)
+            self.assertEqual(len(client.calls), 3)
+
+    async def test_snapshot_races_exhaust_bounded_retries(self):
+        meta, history = snapshot()
+        changed, _ = snapshot(3, 3)
+        client = FakeClient(reads=[
+            (d.METADATA, meta), (d.HISTORY, history), (d.METADATA, changed)] * 2)
+        with self.assertRaisesRegex(d.SnapshotChanged, "2 attempts"):
+            await d.read_snapshot(client, 2)
+        self.assertEqual(len(client.calls), 6)
+
+    async def test_watch_recovers_after_snapshot_races_without_advancing_cursor(self):
+        meta, history = snapshot()
+        changed, _ = snapshot(3, 3)
+        later_meta, later_history = snapshot(24, 30, generation=8, overwritten=6)
+        reads = [
+            (d.STATUS, status()), (d.METADATA, meta), (d.HISTORY, history), (d.METADATA, meta),
+            (d.STATUS, status(uptime=200)),
+            *[(d.METADATA, meta), (d.HISTORY, history), (d.METADATA, changed)] * 2,
+            (d.STATUS, status(uptime=300)),
+            (d.METADATA, later_meta), (d.HISTORY, later_history), (d.METADATA, later_meta)]
+        clock = [0.0]
+
+        class Client(FakeClient):
+            async def read_gatt_char(self, uuid):
+                clock[0] += 1
+                result = await super().read_gatt_char(uuid)
+                if not self.reads:
+                    self.is_connected = False
+                return result
+
+        output = io.StringIO()
+        client = Client(reads=reads)
+        with patch.object(d, "time", SimpleNamespace(monotonic=lambda: clock[0])), \
+                patch.object(d.asyncio, "sleep") as sleep, contextlib.redirect_stdout(output):
+            with self.assertRaises(ConnectionError):
+                await d.watch_connection(client, d.parser().parse_args(
+                    ["watch", "--retries", "2", "--interval", "0.5"]))
+        sleep.assert_has_calls([unittest.mock.call(0.5), unittest.mock.call(0.5)])
+        self.assertEqual(sleep.call_count, 2)
+        reports = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(len(reports), 6)
+        self.assertTrue(reports[2]["stale"])
+        self.assertEqual(reports[2]["poll_latency_ms"], 7000)
+        self.assertTrue(reports[3]["snapshot_inconsistent"])
+        self.assertIn("error", reports[3])
+        self.assertNotIn("events", reports[3])
+        self.assertTrue(reports[1]["history_replay"])
+        self.assertFalse(reports[5]["history_replay"])
+        self.assertTrue(reports[5]["gap_or_reset"])
+        self.assertEqual(reports[5]["modular_gap"], 4)
+
+    async def test_watch_rejects_malformed_history_instead_of_skipping(self):
+        meta, history = snapshot()
+        client = FakeClient(reads=[
+            (d.STATUS, status()), (d.METADATA, meta),
+            (d.HISTORY, history[:-1]), (d.METADATA, meta)])
+        with patch.object(d.asyncio, "sleep") as sleep:
+            with self.assertRaises(d.ProtocolError):
+                await d.watch_connection(client, d.parser().parse_args(["watch"]))
+        sleep.assert_not_called()
 
     async def test_watch_protocol_error_has_no_subscription(self):
         client = FakeClient(reads=[(d.STATUS, b"bad")])
@@ -383,9 +442,63 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         for scanner, args in ((ScaleScanner, ["status"]),
                               (Scanner, ["status", "--address", "other"])):
             before = len(FakeClient.instances)
-            with self.assertRaises(ValueError), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(ConnectionError), contextlib.redirect_stdout(io.StringIO()):
                 await d.run(d.parser().parse_args(args), scanner, FakeClient)
             self.assertEqual(before, len(FakeClient.instances))
+
+    async def test_watch_reconnects_after_temporary_discovery_miss(self):
+        class IntermittentScanner:
+            calls = 0
+
+            @classmethod
+            async def discover(cls, **kwargs):
+                cls.calls += 1
+                return {} if cls.calls == 2 else await Scanner.discover(**kwargs)
+
+        before = len(FakeClient.instances)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), patch.object(d.asyncio, "sleep") as sleep:
+            with self.assertRaises(ConnectionError):
+                await d.run(d.parser().parse_args(["watch", "--reconnects", "2"]),
+                            IntermittentScanner, DisconnectingClient)
+        self.assertEqual(IntermittentScanner.calls, 3)
+        self.assertEqual(len(FakeClient.instances) - before, 2)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(output.getvalue().count('"identity_continuity": "not guaranteed"'), 2)
+        self.assertIn("no matching shotStopper", output.getvalue())
+
+    async def test_missing_device_retries_remain_bounded(self):
+        class EmptyScanner:
+            calls = 0
+
+            @classmethod
+            async def discover(cls, **kwargs):
+                cls.calls += 1
+                return {}
+
+        before = len(FakeClient.instances)
+        with contextlib.redirect_stdout(io.StringIO()), patch.object(d.asyncio, "sleep") as sleep:
+            with self.assertRaises(ConnectionError):
+                await d.run(d.parser().parse_args(["watch", "--reconnects", "2"]),
+                            EmptyScanner, FakeClient)
+        self.assertEqual(EmptyScanner.calls, 3)
+        self.assertEqual(len(FakeClient.instances), before)
+        self.assertEqual(sleep.call_count, 2)
+
+    async def test_ambiguous_discovery_does_not_retry_or_connect(self):
+        class AmbiguousScanner:
+            @staticmethod
+            async def discover(**kwargs):
+                return {"first": (Device(), Advertisement()),
+                        "second": (Device(), Advertisement())}
+
+        before = len(FakeClient.instances)
+        with contextlib.redirect_stdout(io.StringIO()), patch.object(d.asyncio, "sleep") as sleep:
+            with self.assertRaises(ValueError):
+                await d.run(d.parser().parse_args(["watch", "--reconnects", "2"]),
+                            AmbiguousScanner, FakeClient)
+        self.assertEqual(len(FakeClient.instances), before)
+        sleep.assert_not_called()
 
     async def test_reconnect_bounded_and_replay_explicit(self):
         output = io.StringIO()

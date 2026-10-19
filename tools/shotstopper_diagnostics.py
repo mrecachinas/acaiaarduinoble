@@ -28,6 +28,10 @@ class ProtocolError(ValueError):
     pass
 
 
+class SnapshotChanged(Exception):
+    pass
+
+
 def unpack(data, fmt, size, packet_type):
     if len(data) != size:
         raise ProtocolError(f"type {packet_type}: expected {size} bytes, got {len(data)}")
@@ -143,18 +147,14 @@ def decode_history(data, meta):
 async def read_snapshot(client, retries=3):
     if retries < 1:
         raise ValueError("retries must be positive")
-    last_error = None
     for _ in range(retries):
-        try:
-            before = decode_metadata(await client.read_gatt_char(METADATA))
-            data = await client.read_gatt_char(HISTORY)
-            after = decode_metadata(await client.read_gatt_char(METADATA))
-            if before != after:
-                raise ProtocolError("metadata changed during history read")
-            return after, decode_history(data, after)
-        except ProtocolError as error:
-            last_error = error
-    raise ProtocolError(f"no consistent history snapshot after {retries} attempts: {last_error}")
+        before = decode_metadata(await client.read_gatt_char(METADATA))
+        data = await client.read_gatt_char(HISTORY)
+        after = decode_metadata(await client.read_gatt_char(METADATA))
+        if before != after:
+            continue
+        return after, decode_history(data, after)
+    raise SnapshotChanged(f"history changed during all {retries} attempts")
 
 
 def verify_services(client):
@@ -232,13 +232,19 @@ async def watch_connection(client, args):
         accepted = observer.accept(await client.read_gatt_char(STATUS),
                                    received_at=read_started_at)
         read_completed_at = time.monotonic()
-        meta, events = await read_snapshot(client, args.retries)
+        try:
+            meta, events = await read_snapshot(client, args.retries)
+        except SnapshotChanged as error:
+            history_report = {"snapshot_inconsistent": True, "error": str(error)}
+        else:
+            history_report = dict(cursor.observe(meta), snapshot_replayed=True,
+                                  metadata=asdict(meta),
+                                  events=[event.report() for event in events])
         emit(dict(observer.report(),
                   uptime_decreased_reset_or_wrap=accepted["uptime_decreased_reset_or_wrap"],
                   status_read_latency_ms=max(0, int((read_completed_at - read_started_at) * 1000)),
                   poll_latency_ms=max(0, int((time.monotonic() - read_started_at) * 1000))))
-        emit(dict(cursor.observe(meta), snapshot_replayed=True, metadata=asdict(meta),
-                  events=[event.report() for event in events]))
+        emit(history_report)
         if client.is_connected:
             # Wait after completion: delayed reads never trigger catch-up bursts.
             await asyncio.sleep(args.interval)
@@ -257,6 +263,8 @@ async def run(args, scanner, client_factory):
             devices = await discover(scanner, args.timeout)
             if args.address:
                 devices = [d for d in devices if d.address.casefold() == args.address.casefold()]
+            if not devices:
+                raise ConnectionError("no matching shotStopper found during discovery")
             if len(devices) != 1:
                 raise ValueError(f"expected one named shotStopper, found {len(devices)}; use --address")
             async with client_factory(devices[0]) as client:
