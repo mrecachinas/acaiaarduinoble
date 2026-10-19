@@ -55,9 +55,14 @@ AcaiaArduinoBLE::AcaiaArduinoBLE(bool debug){
     _currentWeight = 0;
     _connected = false;
     _packetPeriod = 0;
+    _weightValid = false;
+    _lastWeightTimestampMs = 0;
+    _diagnosticsCallback = NULL;
 }
 
 bool AcaiaArduinoBLE::init(String mac){
+    _weightValid = false;
+    emitDiagnostics(ShotStopperDiagnostics::kConnectionAttempt, 0);
 
     Serial.print("AcaiaArduinoBLE Library v");
     Serial.print(LIBRARY_VERSION);
@@ -71,6 +76,8 @@ bool AcaiaArduinoBLE::init(String mac){
     }else if (!BLE.scanForAddress(mac)){
         Serial.print("Failed to find ");
         Serial.println(mac);
+        emitDiagnostics(ShotStopperDiagnostics::kConnectionFailed,
+                        ShotStopperDiagnostics::kScanFailure);
         return false;
     }
     
@@ -90,12 +97,15 @@ bool AcaiaArduinoBLE::init(String mac){
 
         if (peripheral && isScaleName(peripheral.localName())) {
             BLE.stopScan();
+            _peripheralAddress = peripheral.address();
 
             Serial.println("Connecting ...");
             if (peripheral.connect()) {
                 Serial.println("Connected");
             } else {
                 Serial.println("Failed to connect!");
+                emitDiagnostics(ShotStopperDiagnostics::kConnectionFailed,
+                                ShotStopperDiagnostics::kConnectFailure);
                 return false;
             }
 
@@ -105,6 +115,8 @@ bool AcaiaArduinoBLE::init(String mac){
             } else {
                 Serial.println("Attribute discovery failed!");
                 peripheral.disconnect();
+                emitDiagnostics(ShotStopperDiagnostics::kConnectionFailed,
+                                ShotStopperDiagnostics::kDiscoveryFailure);
                 return false;
             }
 
@@ -148,6 +160,8 @@ bool AcaiaArduinoBLE::init(String mac){
             }
             else{
                 Serial.println("unable to determine scale type");
+                emitDiagnostics(ShotStopperDiagnostics::kConnectionFailed,
+                                ShotStopperDiagnostics::kScaleTypeFailure);
                 return false;
             }
             // Enable non-blocking writeCmd in stock ArduinoBLE by setting BLEWriteWithoutResponse flag (0x04)
@@ -158,9 +172,13 @@ bool AcaiaArduinoBLE::init(String mac){
 
             if(!_read.canSubscribe()){
                 Serial.println("unable to subscribe to READ");
+                emitDiagnostics(ShotStopperDiagnostics::kConnectionFailed,
+                                ShotStopperDiagnostics::kSubscriptionFailure);
                 return false;
             }else if(!_read.subscribe()){
                 Serial.println("subscription failed");
+                emitDiagnostics(ShotStopperDiagnostics::kConnectionFailed,
+                                ShotStopperDiagnostics::kSubscriptionFailure);
                 return false;
             }else {
                 Serial.println("subscribed!");
@@ -171,12 +189,16 @@ bool AcaiaArduinoBLE::init(String mac){
                     Serial.println("identify write successful");
                 }else{
                     Serial.println("identify write failed");
+                    emitDiagnostics(ShotStopperDiagnostics::kConnectionFailed,
+                                    ShotStopperDiagnostics::kIdentifyFailure);
                     return false; 
                 }
                 if(_write.writeValue(NOTIFICATION_REQUEST, sizeof(NOTIFICATION_REQUEST))){
                     Serial.println("notification request write successful");
                 }else{
                     Serial.println("notification request write failed");
+                    emitDiagnostics(ShotStopperDiagnostics::kConnectionFailed,
+                                    ShotStopperDiagnostics::kNotificationRequestFailure);
                 return false; 
                                 }
             }else if(_type == FELICITA){
@@ -186,17 +208,23 @@ bool AcaiaArduinoBLE::init(String mac){
                     Serial.println("felicita weight+timer mode set");
                 }else{
                     Serial.println("felicita mode set failed");
+                    emitDiagnostics(ShotStopperDiagnostics::kConnectionFailed,
+                                    ShotStopperDiagnostics::kModeFailure);
                     return false;
                 }
             }
             _connected = true;
             _packetPeriod = 0;
+            emitDiagnostics(ShotStopperDiagnostics::kConnectionReady,
+                            static_cast<uint8_t>(_type));
             return true;
         }
     }while(millis() - start < 100);
 
     Serial.println("failed to find scale");
     BLE.stopScan(); // Clean up and stop the BLE hardware scan before exiting!
+    emitDiagnostics(ShotStopperDiagnostics::kConnectionFailed,
+                    ShotStopperDiagnostics::kScanFailure);
     return false;    
 }
 
@@ -216,6 +244,7 @@ bool AcaiaArduinoBLE::tare(){
           return true;
     }else{
         _connected = false;
+        emitDiagnostics(ShotStopperDiagnostics::kDisconnected, 1);
         Serial.println("tare write failed");
         return false;
     }
@@ -233,6 +262,7 @@ bool AcaiaArduinoBLE::startTimer(){
         return true;
     }else{
         _connected = false;
+        emitDiagnostics(ShotStopperDiagnostics::kDisconnected, 1);
         Serial.println("start timer write failed");
         return false;
     }
@@ -250,6 +280,7 @@ bool AcaiaArduinoBLE::stopTimer(){
         return true;
     }else{
         _connected = false;
+        emitDiagnostics(ShotStopperDiagnostics::kDisconnected, 1);
         Serial.println("stop timer write failed");
         return false;
     }
@@ -267,6 +298,7 @@ bool AcaiaArduinoBLE::resetTimer(){
         return true;
     }else{
         _connected = false;
+        emitDiagnostics(ShotStopperDiagnostics::kDisconnected, 1);
         Serial.println("reset timer write failed");
         return false;
     }
@@ -278,6 +310,7 @@ bool AcaiaArduinoBLE::tareStartTimer(){
           return true;
     }else{
         _connected = false;
+        emitDiagnostics(ShotStopperDiagnostics::kDisconnected, 1);
         Serial.println("tare and start timer write failed");
         return false;
     }
@@ -291,6 +324,7 @@ bool AcaiaArduinoBLE::beep(){
           return true;
     }else{
         _connected = false;
+        emitDiagnostics(ShotStopperDiagnostics::kDisconnected, 1);
         Serial.println("beep level write failed");
         return false;
     }
@@ -302,11 +336,45 @@ bool AcaiaArduinoBLE::heartbeat(){
         return true;
     }else{
         _connected = false;
+        emitDiagnostics(ShotStopperDiagnostics::kDisconnected, 1);
         return false;
     }
 }
 float AcaiaArduinoBLE::getWeight(){
     return _currentWeight;
+}
+
+void AcaiaArduinoBLE::setDiagnosticsCallback(DiagnosticsCallback callback){
+    _diagnosticsCallback = callback;
+}
+
+bool AcaiaArduinoBLE::hasWeightSample() const{
+    return _weightValid;
+}
+
+uint32_t AcaiaArduinoBLE::lastWeightTimestampMs() const{
+    return _lastWeightTimestampMs;
+}
+
+uint32_t AcaiaArduinoBLE::weightAgeMs() const{
+    if(!_weightValid){
+        return ShotStopperDiagnostics::kNoSampleAge;
+    }
+    uint32_t age = static_cast<uint32_t>(millis()) - _lastWeightTimestampMs;
+    return age >= ShotStopperDiagnostics::kMaximumSampleAge
+        ? ShotStopperDiagnostics::kMaximumSampleAge : age;
+}
+
+bool AcaiaArduinoBLE::isScaleDevice(BLEDevice device) const{
+    return _connected && _peripheralAddress.length() &&
+           device.address() == _peripheralAddress;
+}
+
+void AcaiaArduinoBLE::emitDiagnostics(ShotStopperDiagnostics::EventKind event,
+                                      uint8_t detail){
+    if(_diagnosticsCallback){
+        _diagnosticsCallback(event, detail);
+    }
 }
 
 bool AcaiaArduinoBLE::heartbeatRequired(){
@@ -327,6 +395,8 @@ bool AcaiaArduinoBLE::newWeightAvailable(){
         Serial.println("timeout!");
         //reset connection
         _connected = false;
+        emitDiagnostics(ShotStopperDiagnostics::kTimeout, 0);
+        emitDiagnostics(ShotStopperDiagnostics::kDisconnected, 1);
         BLE.disconnect();
         return false;
     }else if(_read.valueUpdated()){
@@ -402,6 +472,8 @@ bool AcaiaArduinoBLE::newWeightAvailable(){
                 _packetPeriod = millis() - _lastPacket;
             }
             _lastPacket = millis();
+            _lastWeightTimestampMs = static_cast<uint32_t>(_lastPacket);
+            _weightValid = true;
         }
         return newWeightPacket;
     }

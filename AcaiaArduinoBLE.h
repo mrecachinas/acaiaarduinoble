@@ -27,6 +27,7 @@
 
 #include "Arduino.h"
 #include <ArduinoBLE.h>
+#include "ShotStopperDiagnostics.h"
 
 enum scale_type{
     OLD,     // Lunar (pre-2021)
@@ -50,8 +51,16 @@ class AcaiaArduinoBLE{
         bool heartbeatRequired();
         bool isConnected();
         bool newWeightAvailable();
+        typedef void (*DiagnosticsCallback)(ShotStopperDiagnostics::EventKind, uint8_t);
+        void setDiagnosticsCallback(DiagnosticsCallback callback);
+        bool hasWeightSample() const;
+        uint32_t lastWeightTimestampMs() const;
+        uint32_t weightAgeMs() const;
+        // Identifies the current scale link for caller-owned BLE event handlers.
+        bool isScaleDevice(BLEDevice device) const;
     private:
         bool isScaleName(String);
+        void emitDiagnostics(ShotStopperDiagnostics::EventKind event, uint8_t detail);
 
         //debug functions
         void exploreService(BLEService service);
@@ -68,6 +77,10 @@ class AcaiaArduinoBLE{
         bool                _debug; 
         long                _packetPeriod;
         long                _lastPacket;
+        bool                _weightValid;
+        uint32_t            _lastWeightTimestampMs;
+        String              _peripheralAddress;
+        DiagnosticsCallback _diagnosticsCallback;
 };
 
 #endif
