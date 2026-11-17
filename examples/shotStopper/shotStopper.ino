@@ -223,7 +223,9 @@ void setBrewingState(bool brewing){
     }
     Serial.println("Weight Timer End");
   }else{
-    bool waitForRelease = !TIMER_ONLY && !MOMENTARY && !buttonLatched
+    // Applies before and after takeover: a paddle still held after an automatic
+    // stop must not be treated as a new press.
+    bool waitForRelease = !TIMER_ONLY && !MOMENTARY
                       && (shot.end == ENDTYPE::TIME || shot.end == ENDTYPE::WEIGHT);
     if(waitForRelease){
       waitingForPaddleRelease = true;
@@ -243,7 +245,7 @@ void setBrewingState(bool brewing){
       Serial.println("Button Unlatched and not pressed");
     }
 
-    if(waitForRelease){
+    if(waitForRelease && newButtonState){
       Serial.println("waiting for paddle release before next shot");
     }
     Serial.print("ShotEnded by ");

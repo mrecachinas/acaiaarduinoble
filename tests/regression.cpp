@@ -420,6 +420,48 @@ void healthyShotTest() {
     std::puts("healthy fragmented stream, paddle takeover and automatic weight stop: PASS");
 }
 
+void heldPaddleAfterTakeoverTest() {
+    if (MOMENTARY || TIMER_ONLY) return;
+    reset();
+    buttonPressed = false;
+    shot.brewing = false;
+    feed(weight(0));
+    scaleConnected_task();
+    assert(shot.brewing);
+    auto start = static_cast<unsigned long>(shot.start_timestamp_s * 1000);
+    bool latched = false;
+    for (int elapsed = 200; elapsed <= 30000 && shot.brewing; elapsed += 200) {
+        mock::now = start + elapsed;
+        feed(weight(std::max(0, elapsed - 3200) / 50));
+        scaleConnected_task();
+        latched = latched || buttonLatched;
+    }
+    assert(latched && logCount("ShotEnded by weight") == 1);
+    assert(!shot.brewing && mock::outputs[OUT] == LOW);
+
+    // Paddle still held after the weight stop: no restart, retare or relatch.
+    auto endedAt = millis();
+    for (unsigned long t = endedAt; t < endedAt + 60000; t += 100) {
+        mock::now = t;
+        feed(weight(700));
+        scaleConnected_task();
+    }
+    assert(!shot.brewing && !buttonLatched && mock::outputs[OUT] == LOW);
+    assert(logCount("shot started") == 1 && tares() == 2);
+    assert(logCount("waiting for paddle release before next shot") == 1);
+
+    mock::inputs[in] = HIGH;
+    for (int i = 0; i < BUTTON_STATE_ARRAY_LENGTH * 3; ++i) {
+        mock::now += BUTTON_READ_PERIOD_MS + 1;
+        scaleConnected_task();
+    }
+    mock::inputs[in] = LOW;
+    mock::now += BUTTON_READ_PERIOD_MS + 1;
+    scaleConnected_task();
+    assert(shot.brewing && logCount("shot started") == 2);
+    std::puts("held paddle after takeover does not restart until released: PASS");
+}
+
 void heldPaddleCompletionTests() {
     if (MOMENTARY || TIMER_ONLY) return;
     Bytes felicita(18, 0);
@@ -510,5 +552,6 @@ int main() {
     readinessTests();
     stopTests();
     healthyShotTest();
+    heldPaddleAfterTakeoverTest();
     heldPaddleCompletionTests();
 }
