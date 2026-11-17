@@ -314,6 +314,11 @@ bool AcaiaArduinoBLE::beep(){
     }
 }
 
+bool AcaiaArduinoBLE::beepTares(){
+    // beep() sends the Acaia tare command, which only tares Acaia scales.
+    return _type == OLD || _type == NEW;
+}
+
 bool AcaiaArduinoBLE::heartbeat(){
     if(writeCommand(HEARTBEAT, sizeof(HEARTBEAT))){
         _lastHeartBeat = millis();

@@ -33,6 +33,10 @@
                                     // latches.
 #define BUTTON_READ_PERIOD_MS 5
 #define WEIGHT_FRESH_MS       1000  // Maximum weight age when taking over a latching paddle
+#define TARE_CONFIRM_BAND_G   0.5   // A tare is confirmed by readings this close to 0 g
+#define TARE_CONFIRM_SAMPLES  2     //  ...on this many fresh readings
+#define TARE_CONFIRM_GAP_MS   100   //  ...at least this far apart
+#define TARE_CONFIRM_TIMEOUT_MS 1500 // Stop the shot if the takeover tare is not confirmed in time
 #define DRIP_DELAY_S          3     // Time after the shot ended to measure the final weight
 
 #define EEPROM_SIZE 2  // This is 1-Byte
@@ -80,7 +84,7 @@
 
 #define BUTTON_STATE_ARRAY_LENGTH 31
 
-typedef enum {BUTTON, WEIGHT, TIME, DISCONNECT, UNDEF} ENDTYPE;
+typedef enum {BUTTON, WEIGHT, TIME, DISCONNECT, TARE_FAULT, UNDEF} ENDTYPE;
 
 // RGB Colors {Red,Green,Blue}
 int RED[3] = {255, 0, 0};
@@ -98,6 +102,13 @@ static unsigned long lastConnectAttempt = 0;
 unsigned long lastWeight_ms = 0;
 bool hasWeight = false;
 bool warnedStaleWeight = false;
+// Set at takeover when the shot-start tare looks ineffective (reading already at
+// the stop threshold). Weight stopping pauses until the takeover tare is confirmed.
+bool tareSuspect = false;
+unsigned long tareRetry_ms = 0;
+unsigned long lastTareConfirm_ms = 0;
+int tareConfirmSamples = 0;
+bool shotLearnable = true;
 float currentWeight = 0;
 uint8_t goalWeight = 0;      // Goal Weight to be read from EEPROM
 float weightOffset = 0;
@@ -212,6 +223,9 @@ void setBrewingState(bool brewing){
     shot.datapoints = 0;
     shot.expected_end_s = MAX_SHOT_DURATION_S; // don't reuse the previous shot's prediction
     warnedStaleWeight = false;
+    tareSuspect = false;
+    tareConfirmSamples = 0;
+    shotLearnable = true;
     if (CAN_TARE_START_TIMER && AUTOTARE) {
       scale.tareStartTimer();
     } else {
@@ -226,7 +240,8 @@ void setBrewingState(bool brewing){
     // Applies before and after takeover: a paddle still held after an automatic
     // stop must not be treated as a new press.
     bool waitForRelease = !TIMER_ONLY && !MOMENTARY
-                      && (shot.end == ENDTYPE::TIME || shot.end == ENDTYPE::WEIGHT);
+                      && (shot.end == ENDTYPE::TIME || shot.end == ENDTYPE::WEIGHT
+                          || shot.end == ENDTYPE::TARE_FAULT);
     if(waitForRelease){
       waitingForPaddleRelease = true;
     }
@@ -261,6 +276,9 @@ void setBrewingState(bool brewing){
         break;
       case ENDTYPE::DISCONNECT:
         Serial.println("disconnect");
+        break;
+      case ENDTYPE::TARE_FAULT:
+        Serial.println("tare fault");
         break;
       case ENDTYPE::UNDEF:
         Serial.println("undef");
@@ -352,7 +370,26 @@ void scaleConnected_task(){
     }
 
     // update shot trajectory
-    if(shot.brewing && !TIMER_ONLY){
+    if(shot.brewing && !TIMER_ONLY && tareSuspect){
+      // Untrusted reference: only look for the takeover tare taking effect.
+      if(fabs(currentWeight) <= TARE_CONFIRM_BAND_G){
+        if(tareConfirmSamples == 0 || millis() - lastTareConfirm_ms >= TARE_CONFIRM_GAP_MS){
+          tareConfirmSamples++;
+          lastTareConfirm_ms = millis();
+        }
+      }else{
+        tareConfirmSamples = 0;
+      }
+      if(tareConfirmSamples >= TARE_CONFIRM_SAMPLES){
+        tareSuspect = false;
+        shot.datapoints = 0;
+        shot.expected_end_s = MAX_SHOT_DURATION_S;
+        Serial.print(" tare confirmed at ");
+        Serial.print(shotElapsed_s());
+        Serial.print("s, weight stop re-enabled");
+      }
+    }
+    else if(shot.brewing && !TIMER_ONLY){
       shot.time_s[shot.datapoints] = seconds_f()-shot.start_timestamp_s;
       shot.weight[shot.datapoints] = currentWeight;
       shot.shotTimer = shot.time_s[shot.datapoints];
@@ -445,7 +482,22 @@ void scaleConnected_task(){
     digitalWrite(OUT,HIGH); Serial.println("wrote high");
     // Get the scale to beep to inform user.
     if(AUTOTARE){
+      // A reading already at the stop threshold means the shot-start tare did not take.
+      bool suspect = scale.beepTares() && currentWeight >= (goalWeight - weightOffset);
       scale.beep();
+      if(scale.beepTares()){
+        // The beep is an Acaia tare: earlier points and predictions use the old reference.
+        shot.datapoints = 0;
+        shot.expected_end_s = MAX_SHOT_DURATION_S;
+      }
+      if(suspect){
+        tareSuspect = true;
+        tareRetry_ms = millis();
+        tareConfirmSamples = 0;
+        Serial.print("initial tare looks ineffective (");
+        Serial.print(currentWeight);
+        Serial.println("g at takeover), weight stop paused until the takeover tare is confirmed");
+      }
     }
   }
 
@@ -475,6 +527,20 @@ void scaleConnected_task(){
     setBrewingState(shot.brewing);
   }
 
+  // Takeover tare never confirmed: the weight reference cannot be trusted.
+  else if(shot.brewing
+  && tareSuspect
+  && millis() - tareRetry_ms > TARE_CONFIRM_TIMEOUT_MS){
+    tareSuspect = false;
+    shotLearnable = false;
+    shot.brewing = false;
+    Serial.print("tare not confirmed, stopping shot at ");
+    Serial.print(currentWeight);
+    Serial.println("g");
+    shot.end = ENDTYPE::TARE_FAULT;
+    setBrewingState(shot.brewing);
+  }
+
   //Blink LED while brewing
   if(shot.brewing){
     setColor( (millis()/1000)%2 ? GREEN : BLUE );
@@ -496,6 +562,7 @@ void scaleConnected_task(){
 
   //Detect error of shot
   if(!TIMER_ONLY
+  && shotLearnable
   && shot.start_timestamp_s
   && shot.end_s
   && currentWeight >= (goalWeight - weightOffset)

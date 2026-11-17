@@ -462,6 +462,56 @@ void heldPaddleAfterTakeoverTest() {
     std::puts("held paddle after takeover does not restart until released: PASS");
 }
 
+// Cup weight stays on the scale because the shot-start tare did not take.
+void ineffectiveInitialTareTests() {
+    if (MOMENTARY || TIMER_ONLY) return;
+    for (bool recovers : {true, false}) {
+        reset();
+        buttonPressed = false;
+        shot.brewing = false;
+        feed(weight(2729));
+        scaleConnected_task();
+        assert(shot.brewing);
+        auto start = static_cast<unsigned long>(shot.start_timestamp_s * 1000);
+        unsigned long latchedAt = 0;
+        bool stoppedEarly = false;
+        for (int elapsed = 100; elapsed <= 30000 && shot.brewing; elapsed += 100) {
+            mock::now = start + elapsed;
+            if (buttonLatched && !latchedAt) latchedAt = millis();
+            if (buttonLatched && !REEDSWITCH && recovers) mock::inputs[in] = HIGH;
+            // The takeover tare takes effect about 300 ms after it is sent.
+            bool tared = recovers && latchedAt && millis() >= latchedAt + 300;
+            uint16_t tenths = tared ? std::max(0, elapsed - 10000) / 50 : 2729;
+            feed(weight(tenths));
+            scaleConnected_task();
+            if (!shot.brewing && elapsed < 10000) stoppedEarly = recovers;
+        }
+        assert(!stoppedEarly);
+        assert(latchedAt && logCount("initial tare looks ineffective") == 1);
+        assert(logCount("shot started") == 1 && tares() == 2);
+        assert(!shot.brewing && mock::outputs[OUT] == LOW && !buttonLatched);
+        if (recovers) {
+            assert(logCount("tare confirmed") == 1);
+            assert(logCount("ShotEnded by weight") == 1);
+            assert(shot.end_s > 25 && shot.end_s < 29);
+        } else {
+            assert(logCount("ShotEnded by tare fault") == 1);
+            assert(logCount("weight achieved") == 0);
+            assert(shot.end_s * 1000 < latchedAt - start + TARE_CONFIRM_TIMEOUT_MS + 200);
+            // Held paddle and late data: no restart and no learning from the bad reference.
+            auto endedAt = millis();
+            for (unsigned long t = endedAt; t < endedAt + 60000; t += 100) {
+                mock::now = t;
+                feed(weight(2729));
+                scaleConnected_task();
+            }
+            assert(!shot.brewing && logCount("shot started") == 1);
+            assert(logCount("I detected a final weight") == 0);
+        }
+    }
+    std::puts("ineffective initial tare: takeover tare recovery and bounded fault: PASS");
+}
+
 void heldPaddleCompletionTests() {
     if (MOMENTARY || TIMER_ONLY) return;
     Bytes felicita(18, 0);
@@ -553,5 +603,6 @@ int main() {
     stopTests();
     healthyShotTest();
     heldPaddleAfterTakeoverTest();
+    ineffectiveInitialTareTests();
     heldPaddleCompletionTests();
 }
