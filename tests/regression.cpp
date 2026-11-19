@@ -3,6 +3,7 @@
 #include "EEPROM.h"
 #include <cassert>
 #include <climits>
+#include <cmath>
 #include <cstdio>
 #include <random>
 
@@ -124,9 +125,12 @@ void parserTests() {
         "efdd0c0e0b00410b0001050000000001001b51",
     };
     Bytes packed;
+    // Weights can follow command acknowledgements (0x0B) in the same event frame.
+    const bool captureHasWeight[] = {false, true, false, true, true, true};
+    size_t captureIndex = 0;
     for (auto hex : captures) {
         auto bytes = unhex(hex);
-        bool isWeight = bytes[2] == 12 && bytes[4] == 5;
+        bool isWeight = captureHasWeight[captureIndex++];
         for (size_t split = 1; split < bytes.size(); ++split) {
             reset();
             feed(Bytes(bytes.begin(), bytes.begin() + split));
@@ -142,6 +146,30 @@ void parserTests() {
     feed(packed);
     assert(scale.newWeightAvailable() && closeWeight(0));
     assert(scale._rxLen == 0);
+
+    // Bundled sub-events: the weight is decoded wherever known sub-events place it.
+    const Bytes w300 = {0x2c, 0x01, 0, 0, 1, 0};
+    auto bundled = [&](uint8_t type, Bytes before, bool truncate = false) {
+        before.push_back(0x05);
+        before.insert(before.end(), w300.begin(), w300.end() - (truncate ? 2 : 0));
+        return frame(type, before);
+    };
+    reset();
+    feed(bundled(0x0B, {0x00, 0x80}));
+    assert(scale.newWeightAvailable() && closeWeight(30));
+    reset();
+    feed(bundled(0x0B, {0x00, 0x41, 0x0B, 0x00, 0x01}));
+    assert(scale.newWeightAvailable() && closeWeight(30));
+    reset();
+    feed(frame(0x05, {0x2c, 0x01, 0, 0, 1, 0, 0x07, 0, 0, 2}));
+    assert(scale.newWeightAvailable() && closeWeight(30));
+    // Unknown sub-event sizes and truncated weights are ignored, not guessed.
+    reset();
+    feed(bundled(0x08, {0x00}));
+    assert(!scale.newWeightAvailable() && closeWeight(0));
+    reset();
+    feed(bundled(0x0B, {0x00, 0x80}, true));
+    assert(!scale.newWeightAvailable() && closeWeight(0));
 
     reset();
     std::mt19937 rng(2021);
@@ -512,6 +540,156 @@ void ineffectiveInitialTareTests() {
     std::puts("ineffective initial tare: takeover tare recovery and bounded fault: PASS");
 }
 
+size_t stopTimerWrites() {
+    Bytes stop(STOP_TIMER, STOP_TIMER + sizeof(STOP_TIMER));
+    return std::count_if(mock::writes.begin(), mock::writes.end(),
+                         [&](const mock::Write& w) { return w.bytes == stop; });
+}
+
+// Starts a latching shot with the paddle pressed and returns its start time.
+unsigned long pressToStart() {
+    buttonPressed = false;
+    shot.brewing = false;
+    feed(weight(0));
+    scaleConnected_task();
+    assert(shot.brewing);
+    return static_cast<unsigned long>(shot.start_timestamp_s * 1000);
+}
+
+void runFor(unsigned long until, uint16_t tenths) {
+    while (millis() + 100 <= until) {
+        mock::now += 100;
+        feed(weight(tenths));
+        loop();
+    }
+}
+
+void heldPaddleDisconnectTest() {
+    if (MOMENTARY || TIMER_ONLY) return;
+    reset();
+    auto start = pressToStart();
+    runFor(start + 4000, 0);
+    assert(buttonLatched && mock::outputs[OUT] == HIGH);
+
+    // Scale lost after takeover with the paddle still on.
+    scale._connected = false;
+    loop();
+    assert(!shot.brewing && mock::outputs[OUT] == LOW);
+    assert(logCount("ShotEnded by disconnect") == 1);
+
+    // Reconnecting while still held must not restart, retare or relatch.
+    scale._connected = true;
+    scale._connectedAt = millis();
+    runFor(start + 20000, 0);
+    assert(!shot.brewing && !buttonLatched && mock::outputs[OUT] == LOW);
+    assert(logCount("shot started") == 1 && tares() == 2);
+
+    mock::inputs[in] = HIGH;
+    for (int i = 0; i < BUTTON_STATE_ARRAY_LENGTH * 3; ++i) {
+        mock::now += BUTTON_READ_PERIOD_MS + 1;
+        loop();
+    }
+    mock::inputs[in] = LOW;
+    runFor(millis() + 200, 0);
+    assert(shot.brewing && logCount("shot started") == 2);
+    std::puts("held paddle through disconnect does not restart until released: PASS");
+}
+
+void learningOnlyAfterWeightStopTests() {
+    if (MOMENTARY || TIMER_ONLY) return;
+    // A purge stopped with the paddle, then a cup at the target: nothing to learn.
+    reset();
+    auto start = pressToStart();
+    mock::now = start + 1200;
+    releasePaddle();
+    feed(weight(0));
+    scaleConnected_task();
+    assert(!shot.brewing && logCount("ShotEnded by button") == 1);
+    runFor(start + 10000, 350);
+    assert(weightOffset == 1.5f && logCount("I detected a final weight") == 0);
+
+    // Takeover near the time limit with an untared cup: the time stop preempts the
+    // tare fault, and must neither learn nor leave the suspect flag behind.
+    reset();
+    start = pressToStart();
+    mock::now = start + 49200;
+    feed(weight(370));
+    scaleConnected_task();
+    assert(buttonLatched && tareSuspect);
+    runFor(start + 56000, 370);
+    assert(logCount("ShotEnded by time") == 1 && logCount("tare fault") == 0);
+    assert(!tareSuspect && weightOffset == 1.5f);
+    assert(logCount("I detected a final weight") == 0);
+
+    // A purge must not leave an end time that analyses the next shot mid-brew.
+    reset();
+    start = pressToStart();
+    mock::now = start + 1200;
+    releasePaddle();
+    feed(weight(0));
+    scaleConnected_task();
+    mock::inputs[in] = LOW;
+    auto second = millis();
+    runFor(second + 1500, 0);
+    assert(shot.brewing && logCount("shot started") == 2);
+    runFor(second + 12000, 0);
+    runFor(second + 12300, 370); // sudden on-target reading while brewing
+    assert(logCount("I detected a final weight") == 0 && weightOffset == 1.5f);
+    std::puts("offset learning only after weight stops: PASS");
+}
+
+void flatWeightPredictionTest() {
+    if (TIMER_ONLY) return;
+    // Exactly representable samples give a zero slope; no infinity may be produced.
+    for (float w : {40.0f, 20.0f}) {
+        reset();
+        shot.datapoints = N;
+        for (int i = 0; i < N; ++i) {
+            shot.time_s[i] = 10 + i * 0.5f;
+            shot.weight[i] = w;
+        }
+        calculateEndTime(&shot);
+        assert(std::isfinite(shot.expected_end_s));
+        if (w >= goalWeight - weightOffset) {
+            assert(shot.expected_end_s <= shot.time_s[N - 1]);
+        } else {
+            assert(shot.expected_end_s == MAX_SHOT_DURATION_S);
+        }
+    }
+    std::puts("zero-flow prediction stays finite: PASS");
+}
+
+void stopTimerResendTests() {
+    if (MOMENTARY || TIMER_ONLY) return;
+    reset();
+    auto start = pressToStart();
+    mock::now = start + 1000;
+    releasePaddle();
+    feed(weight(0));
+    scaleConnected_task();
+    assert(!shot.brewing && stopTimerWrites() == 1);
+    runFor(start + 3500, 0);
+    assert(stopTimerWrites() == 2);
+    runFor(start + 8000, 0);
+    assert(stopTimerWrites() == 2);
+
+    if (!REEDSWITCH) {
+        // A new shot inside the resend window cancels it: its timer keeps running.
+        reset();
+        start = pressToStart();
+        mock::now = start + 1000;
+        releasePaddle();
+        feed(weight(0));
+        scaleConnected_task();
+        mock::inputs[in] = LOW;
+        runFor(start + 1300, 0);
+        assert(shot.brewing && logCount("shot started") == 2);
+        runFor(start + 3500, 0);
+        assert(shot.brewing && stopTimerWrites() == 1);
+    }
+    std::puts("timer stop resent once, and never into a new shot: PASS");
+}
+
 void heldPaddleCompletionTests() {
     if (MOMENTARY || TIMER_ONLY) return;
     Bytes felicita(18, 0);
@@ -604,5 +782,9 @@ int main() {
     healthyShotTest();
     heldPaddleAfterTakeoverTest();
     ineffectiveInitialTareTests();
+    heldPaddleDisconnectTest();
+    learningOnlyAfterWeightStopTests();
+    flatWeightPredictionTest();
+    stopTimerResendTests();
     heldPaddleCompletionTests();
 }

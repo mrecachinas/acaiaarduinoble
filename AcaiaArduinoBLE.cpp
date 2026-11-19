@@ -509,9 +509,8 @@ bool AcaiaArduinoBLE::parseRxBuffer(){
             continue;
         }
 
-        // Event message (0x0C) of type weight (0x05): payload starts at byte 5
-        if(_rxBuf[i + 2] == 0x0C && _rxBuf[i + 4] == 0x05 && frameLength >= 13
-           && decodeWeight(&_rxBuf[i + 5])){
+        // Event message (0x0C): one or more sub-events after the length byte
+        if(_rxBuf[i + 2] == 0x0C && decodeEvents(&_rxBuf[i + 4], len - 1)){
             newWeight = true;
         }
         i += frameLength;
@@ -520,6 +519,26 @@ bool AcaiaArduinoBLE::parseRxBuffer(){
     if(i > 0){
         memmove(_rxBuf, _rxBuf + i, _rxLen - i);
         _rxLen -= i;
+    }
+    return newWeight;
+}
+
+// An event message can bundle sub-events, e.g. a weight (0x05) after one or more
+// command acknowledgements (0x0B) or before a timer event (0x07). Walk the known
+// sizes (type byte included) and stop at anything unknown or truncated.
+bool AcaiaArduinoBLE::decodeEvents(const uint8_t* events, int length){
+    bool newWeight = false;
+    int k = 0;
+    while(k < length){
+        uint8_t type = events[k];
+        int size = type == 0x05 ? 7 : type == 0x0B ? 3 : type == 0x07 ? 4 : 0;
+        if(size == 0 || k + size > length){
+            break;
+        }
+        if(type == 0x05 && decodeWeight(&events[k + 1])){
+            newWeight = true;
+        }
+        k += size;
     }
     return newWeight;
 }

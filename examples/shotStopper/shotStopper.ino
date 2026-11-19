@@ -37,6 +37,7 @@
 #define TARE_CONFIRM_SAMPLES  2     //  ...on this many fresh readings
 #define TARE_CONFIRM_GAP_MS   100   //  ...at least this far apart
 #define TARE_CONFIRM_TIMEOUT_MS 1500 // Stop the shot if the takeover tare is not confirmed in time
+#define STOP_TIMER_RESEND_MS  1000  // Resend the idempotent timer stop once; scales occasionally ignore it
 #define DRIP_DELAY_S          3     // Time after the shot ended to measure the final weight
 
 #define EEPROM_SIZE 2  // This is 1-Byte
@@ -108,7 +109,9 @@ bool tareSuspect = false;
 unsigned long tareRetry_ms = 0;
 unsigned long lastTareConfirm_ms = 0;
 int tareConfirmSamples = 0;
-bool shotLearnable = true;
+bool shotLearnable = false;
+bool stopTimerResendPending = false;
+unsigned long stopTimerSent_ms = 0;
 float currentWeight = 0;
 uint8_t goalWeight = 0;      // Goal Weight to be read from EEPROM
 float weightOffset = 0;
@@ -196,6 +199,7 @@ void loop() {
   if(!scale.isConnected()){
     lastWeight_ms = 0;
     hasWeight = false;
+    stopTimerResendPending = false;
     if(shot.brewing){
       shot.brewing = false;
       shot.end = ENDTYPE::DISCONNECT;
@@ -219,13 +223,15 @@ void setBrewingState(bool brewing){
   if(brewing){
     Serial.println("shot started");
     shot.start_timestamp_s = seconds_f();
+    shot.end_s = 0; // a previous shot's end time must not be analysed during this one
     shot.shotTimer = 0;
     shot.datapoints = 0;
     shot.expected_end_s = MAX_SHOT_DURATION_S; // don't reuse the previous shot's prediction
     warnedStaleWeight = false;
     tareSuspect = false;
     tareConfirmSamples = 0;
-    shotLearnable = true;
+    shotLearnable = false;
+    stopTimerResendPending = false; // must not stop the new shot's timer
     if (CAN_TARE_START_TIMER && AUTOTARE) {
       scale.tareStartTimer();
     } else {
@@ -238,13 +244,17 @@ void setBrewingState(bool brewing){
     Serial.println("Weight Timer End");
   }else{
     // Applies before and after takeover: a paddle still held after an automatic
-    // stop must not be treated as a new press.
+    // stop or a scale disconnect must not be treated as a new press.
     bool waitForRelease = !TIMER_ONLY && !MOMENTARY
                       && (shot.end == ENDTYPE::TIME || shot.end == ENDTYPE::WEIGHT
-                          || shot.end == ENDTYPE::TARE_FAULT);
+                          || shot.end == ENDTYPE::TARE_FAULT
+                          || shot.end == ENDTYPE::DISCONNECT);
     if(waitForRelease){
       waitingForPaddleRelease = true;
     }
+    // The offset models overshoot after a weight stop; other endings say nothing about it.
+    shotLearnable = (shot.end == ENDTYPE::WEIGHT);
+    tareSuspect = false;
     shot.end_s = seconds_f() - shot.start_timestamp_s;
     if(!TIMER_ONLY
     && MOMENTARY
@@ -287,6 +297,8 @@ void setBrewingState(bool brewing){
 
     if(scale.isConnected()){
       scale.stopTimer();
+      stopTimerResendPending = true;
+      stopTimerSent_ms = millis();
     }
   } 
 
@@ -317,7 +329,15 @@ void calculateEndTime(Shot* s){
 
     //Calculate time at which goal weight will be reached (x = (y-b)/m)
     // if M is negative (which can happen during a blooming shot when the flow stops) assume max duration (issue #29)
-    s->expected_end_s = (m < 0) ? MAX_SHOT_DURATION_S : (goalWeight - weightOffset - b)/m;
+    // With no flow, avoid dividing by zero: the goal is either already reached or not reachable.
+    float threshold = goalWeight - weightOffset;
+    if(m < 0){
+      s->expected_end_s = MAX_SHOT_DURATION_S;
+    }else if(m == 0){
+      s->expected_end_s = (b >= threshold) ? s->time_s[s->datapoints-1] : MAX_SHOT_DURATION_S;
+    }else{
+      s->expected_end_s = (threshold - b)/m;
+    }
   }
 }
 
@@ -408,6 +428,12 @@ void scaleConnected_task(){
 
   if(!scale.isConnected()){
     return; // loop() releases the machine before reconnecting
+  }
+
+  if(stopTimerResendPending && !shot.brewing
+  && millis() - stopTimerSent_ms >= STOP_TIMER_RESEND_MS){
+    stopTimerResendPending = false;
+    scale.stopTimer();
   }
 
   // Read button every period
@@ -531,8 +557,6 @@ void scaleConnected_task(){
   else if(shot.brewing
   && tareSuspect
   && millis() - tareRetry_ms > TARE_CONFIRM_TIMEOUT_MS){
-    tareSuspect = false;
-    shotLearnable = false;
     shot.brewing = false;
     Serial.print("tare not confirmed, stopping shot at ");
     Serial.print(currentWeight);
@@ -562,6 +586,7 @@ void scaleConnected_task(){
 
   //Detect error of shot
   if(!TIMER_ONLY
+  && !shot.brewing
   && shotLearnable
   && shot.start_timestamp_s
   && shot.end_s

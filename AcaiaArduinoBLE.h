@@ -62,6 +62,7 @@ class AcaiaArduinoBLE{
         static void onNotification(BLEDevice device, BLECharacteristic characteristic);
         void appendRx(const uint8_t* data, int length);
         bool parseRxBuffer();
+        bool decodeEvents(const uint8_t* events, int length);
         bool decodeWeight(const uint8_t* payload);
         static AcaiaArduinoBLE* _instance;
 
