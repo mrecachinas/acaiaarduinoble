@@ -32,6 +32,12 @@
                                     // looses control of the paddle once the system
                                     // latches.
 #define BUTTON_READ_PERIOD_MS 5
+#define WEIGHT_FRESH_MS       1000  // Maximum weight age when taking over a latching paddle
+#define TARE_CONFIRM_BAND_G   0.5   // A tare is confirmed by readings this close to 0 g
+#define TARE_CONFIRM_SAMPLES  2     //  ...on this many fresh readings
+#define TARE_CONFIRM_GAP_MS   100   //  ...at least this far apart
+#define TARE_CONFIRM_TIMEOUT_MS 1500 // Stop the shot if the takeover tare is not confirmed in time
+#define STOP_TIMER_RESEND_MS  1000  // Resend the idempotent timer stop once; scales occasionally ignore it
 #define DRIP_DELAY_S          3     // Time after the shot ended to measure the final weight
 
 #define EEPROM_SIZE 2  // This is 1-Byte
@@ -63,7 +69,7 @@
   #define IN          21
   #define OUT         38
   #define REED_IN     18
-#elifdef ARDUINO_ESP32C3_DEV
+#elif defined(ARDUINO_ESP32C3_DEV)
   #define LED_RED     21
   #define LED_BLUE    10
   #define LED_GREEN   20
@@ -79,7 +85,7 @@
 
 #define BUTTON_STATE_ARRAY_LENGTH 31
 
-typedef enum {BUTTON, WEIGHT, TIME, DISCONNECT, UNDEF} ENDTYPE;
+typedef enum {BUTTON, WEIGHT, TIME, DISCONNECT, TARE_FAULT, UNDEF} ENDTYPE;
 
 // RGB Colors {Red,Green,Blue}
 int RED[3] = {255, 0, 0};
@@ -94,6 +100,18 @@ int currentColor[3] = {0,0,0};
 
 AcaiaArduinoBLE scale(DEBUG);
 static unsigned long lastConnectAttempt = 0;
+unsigned long lastWeight_ms = 0;
+bool hasWeight = false;
+bool warnedStaleWeight = false;
+// Set at takeover when the shot-start tare looks ineffective (reading already at
+// the stop threshold). Weight stopping pauses until the takeover tare is confirmed.
+bool tareSuspect = false;
+unsigned long tareRetry_ms = 0;
+unsigned long lastTareConfirm_ms = 0;
+int tareConfirmSamples = 0;
+bool shotLearnable = false;
+bool stopTimerResendPending = false;
+unsigned long stopTimerSent_ms = 0;
 float currentWeight = 0;
 uint8_t goalWeight = 0;      // Goal Weight to be read from EEPROM
 float weightOffset = 0;
@@ -104,6 +122,7 @@ int buttonArr[BUTTON_STATE_ARRAY_LENGTH];            // last 4 readings of the b
 int in = REEDSWITCH ? REED_IN : IN;
 bool buttonPressed = false; //physical status of button
 bool buttonLatched = false; //electrical status of button
+bool waitingForPaddleRelease = false;
 unsigned long lastButtonRead_ms = 0;
 int newButtonState = 0;
 
@@ -173,23 +192,30 @@ void setup() {
 
 void loop() {
 
-  // Attempt to connect to scale every 1 seconds
-  if(!scale.isConnected() & millis() - lastConnectAttempt >= 1000){
+  if(scale.isConnected()){
+    scaleConnected_task();
+  }
+
+  if(!scale.isConnected()){
+    lastWeight_ms = 0;
+    hasWeight = false;
+    stopTimerResendPending = false;
+    if(shot.brewing){
+      shot.brewing = false;
+      shot.end = ENDTYPE::DISCONNECT;
+      setBrewingState(false);
+    }
+
+    // Release the machine before any potentially blocking reconnect attempt.
+    if(millis() - lastConnectAttempt >= 1000){
       lastConnectAttempt = millis();
       setColor(RED);
       scale.init(); 
       currentWeight = 0;
-      if(shot.brewing){
-        shot.brewing = false;
-        shot.end = ENDTYPE::DISCONNECT;
-        setBrewingState(false);
-      }
       if(scale.isConnected()){
         setColor(YELLOW);
       }
-  }
-  else if(scale.isConnected()){
-    scaleConnected_task();
+    }
   }
 }
 
@@ -197,8 +223,15 @@ void setBrewingState(bool brewing){
   if(brewing){
     Serial.println("shot started");
     shot.start_timestamp_s = seconds_f();
+    shot.end_s = 0; // a previous shot's end time must not be analysed during this one
     shot.shotTimer = 0;
     shot.datapoints = 0;
+    shot.expected_end_s = MAX_SHOT_DURATION_S; // don't reuse the previous shot's prediction
+    warnedStaleWeight = false;
+    tareSuspect = false;
+    tareConfirmSamples = 0;
+    shotLearnable = false;
+    stopTimerResendPending = false; // must not stop the new shot's timer
     if (CAN_TARE_START_TIMER && AUTOTARE) {
       scale.tareStartTimer();
     } else {
@@ -210,6 +243,36 @@ void setBrewingState(bool brewing){
     }
     Serial.println("Weight Timer End");
   }else{
+    // Applies before and after takeover: a paddle still held after an automatic
+    // stop or a scale disconnect must not be treated as a new press.
+    bool waitForRelease = !TIMER_ONLY && !MOMENTARY
+                      && (shot.end == ENDTYPE::TIME || shot.end == ENDTYPE::WEIGHT
+                          || shot.end == ENDTYPE::TARE_FAULT
+                          || shot.end == ENDTYPE::DISCONNECT);
+    if(waitForRelease){
+      waitingForPaddleRelease = true;
+    }
+    // The offset models overshoot after a weight stop; other endings say nothing about it.
+    shotLearnable = (shot.end == ENDTYPE::WEIGHT);
+    tareSuspect = false;
+    shot.end_s = seconds_f() - shot.start_timestamp_s;
+    if(!TIMER_ONLY
+    && MOMENTARY
+    && (ENDTYPE::WEIGHT == shot.end || ENDTYPE::TIME == shot.end)){
+      digitalWrite(OUT,HIGH);Serial.println("wrote high");
+      delay(300);
+      digitalWrite(OUT,LOW);Serial.println("wrote low");
+      buttonPressed = false;
+    }else if(!TIMER_ONLY && !MOMENTARY){
+      buttonLatched = false;
+      buttonPressed = false;
+      digitalWrite(OUT,LOW); Serial.println("wrote low");
+      Serial.println("Button Unlatched and not pressed");
+    }
+
+    if(waitForRelease && newButtonState){
+      Serial.println("waiting for paddle release before next shot");
+    }
     Serial.print("ShotEnded by ");
     switch (shot.end) {
       case ENDTYPE::TIME:
@@ -224,26 +287,18 @@ void setBrewingState(bool brewing){
       case ENDTYPE::DISCONNECT:
         Serial.println("disconnect");
         break;
+      case ENDTYPE::TARE_FAULT:
+        Serial.println("tare fault");
+        break;
       case ENDTYPE::UNDEF:
         Serial.println("undef");
         break;
     }
 
-    shot.end_s = seconds_f() - shot.start_timestamp_s;
-    scale.stopTimer();
-    if(!TIMER_ONLY 
-    && MOMENTARY 
-    && (ENDTYPE::WEIGHT == shot.end || ENDTYPE::TIME == shot.end)){
-      //Pulse button to stop brewing
-      digitalWrite(OUT,HIGH);Serial.println("wrote high");
-      delay(300);
-      digitalWrite(OUT,LOW);Serial.println("wrote low");
-      buttonPressed = false;
-    }else if(!TIMER_ONLY && !MOMENTARY){
-      buttonLatched = false;
-      buttonPressed = false;
-      Serial.println("Button Unlatched and not pressed");
-      digitalWrite(OUT,LOW); Serial.println("wrote low");
+    if(scale.isConnected()){
+      scale.stopTimer();
+      stopTimerResendPending = true;
+      stopTimerSent_ms = millis();
     }
   } 
 
@@ -274,12 +329,24 @@ void calculateEndTime(Shot* s){
 
     //Calculate time at which goal weight will be reached (x = (y-b)/m)
     // if M is negative (which can happen during a blooming shot when the flow stops) assume max duration (issue #29)
-    s->expected_end_s = (m < 0) ? MAX_SHOT_DURATION_S : (goalWeight - weightOffset - b)/m;
+    // With no flow, avoid dividing by zero: the goal is either already reached or not reachable.
+    float threshold = goalWeight - weightOffset;
+    if(m < 0){
+      s->expected_end_s = MAX_SHOT_DURATION_S;
+    }else if(m == 0){
+      s->expected_end_s = (b >= threshold) ? s->time_s[s->datapoints-1] : MAX_SHOT_DURATION_S;
+    }else{
+      s->expected_end_s = (threshold - b)/m;
+    }
   }
 }
 
 float seconds_f(){
   return millis()/1000.0;
+}
+
+float shotElapsed_s(){
+  return seconds_f() - shot.start_timestamp_s;
 }
 
 void setColor(int rgb[3]){
@@ -313,6 +380,8 @@ void scaleConnected_task(){
   // otherwise getWeight() will return stale data
   if(scale.newWeightAvailable()){
     currentWeight = scale.getWeight();
+    lastWeight_ms = millis();
+    hasWeight = true;
 
     Serial.print(currentWeight);
 
@@ -321,7 +390,26 @@ void scaleConnected_task(){
     }
 
     // update shot trajectory
-    if(shot.brewing && !TIMER_ONLY){
+    if(shot.brewing && !TIMER_ONLY && tareSuspect){
+      // Untrusted reference: only look for the takeover tare taking effect.
+      if(fabs(currentWeight) <= TARE_CONFIRM_BAND_G){
+        if(tareConfirmSamples == 0 || millis() - lastTareConfirm_ms >= TARE_CONFIRM_GAP_MS){
+          tareConfirmSamples++;
+          lastTareConfirm_ms = millis();
+        }
+      }else{
+        tareConfirmSamples = 0;
+      }
+      if(tareConfirmSamples >= TARE_CONFIRM_SAMPLES){
+        tareSuspect = false;
+        shot.datapoints = 0;
+        shot.expected_end_s = MAX_SHOT_DURATION_S;
+        Serial.print(" tare confirmed at ");
+        Serial.print(shotElapsed_s());
+        Serial.print("s, weight stop re-enabled");
+      }
+    }
+    else if(shot.brewing && !TIMER_ONLY){
       shot.time_s[shot.datapoints] = seconds_f()-shot.start_timestamp_s;
       shot.weight[shot.datapoints] = currentWeight;
       shot.shotTimer = shot.time_s[shot.datapoints];
@@ -336,6 +424,16 @@ void scaleConnected_task(){
       Serial.print(shot.expected_end_s);
     }
     Serial.println();
+  }
+
+  if(!scale.isConnected()){
+    return; // loop() releases the machine before reconnecting
+  }
+
+  if(stopTimerResendPending && !shot.brewing
+  && millis() - stopTimerSent_ms >= STOP_TIMER_RESEND_MS){
+    stopTimerResendPending = false;
+    scale.stopTimer();
   }
 
   // Read button every period
@@ -361,6 +459,11 @@ void scaleConnected_task(){
     }
     //Serial.println();
 
+    // Only real debounced input can re-arm; the reed ignore window is synthetic.
+    if(!newButtonState){
+      waitingForPaddleRelease = false;
+    }
+
     //The reed switch measurements require a small amount of delay for accuracy.
     //  if the shot just stopped, assume that the reed switch should read "open" for the first 0.5s
     if(REEDSWITCH && !shot.brewing && seconds_f() < (shot.start_timestamp_s + shot.end_s + 1)){
@@ -369,10 +472,18 @@ void scaleConnected_task(){
     }
   }
 
+  bool weightFresh = hasWeight && millis() - lastWeight_ms <= WEIGHT_FRESH_MS;
+  if(!TIMER_ONLY && !MOMENTARY && shot.brewing && !buttonLatched
+  && newButtonState && shotElapsed_s() > MIN_SHOT_DURATION_S
+  && !weightFresh && !warnedStaleWeight){
+    Serial.println("no fresh scale data, not taking over, paddle stays in control");
+    warnedStaleWeight = true;
+  }
+
   // SHOT INITIATION EVENTS --------------------------------
   
   //button just pressed (and released)
-  if(newButtonState && buttonPressed == false ){
+  if(newButtonState && buttonPressed == false && !waitingForPaddleRelease){
     Serial.println("ButtonPressed");
     buttonPressed = true;
     if(!MOMENTARY || REEDSWITCH){
@@ -382,18 +493,37 @@ void scaleConnected_task(){
   }
     
   // button held. Take over for the rest of the shot.
+  // Keep elapsed timing independent of packets, but only take over with fresh data.
   else if(!TIMER_ONLY
   && !MOMENTARY 
   && shot.brewing 
   && !buttonLatched 
-  && (shot.shotTimer > MIN_SHOT_DURATION_S) 
+  && newButtonState
+  && weightFresh
+  && (shotElapsed_s() > MIN_SHOT_DURATION_S)
+  && (shotElapsed_s() <= MAX_SHOT_DURATION_S)
   ){
     buttonLatched = true;
     Serial.println("Button Latched");
     digitalWrite(OUT,HIGH); Serial.println("wrote high");
     // Get the scale to beep to inform user.
     if(AUTOTARE){
+      // A reading already at the stop threshold means the shot-start tare did not take.
+      bool suspect = scale.beepTares() && currentWeight >= (goalWeight - weightOffset);
       scale.beep();
+      if(scale.beepTares()){
+        // The beep is an Acaia tare: earlier points and predictions use the old reference.
+        shot.datapoints = 0;
+        shot.expected_end_s = MAX_SHOT_DURATION_S;
+      }
+      if(suspect){
+        tareSuspect = true;
+        tareRetry_ms = millis();
+        tareConfirmSamples = 0;
+        Serial.print("initial tare looks ineffective (");
+        Serial.print(currentWeight);
+        Serial.println("g at takeover), weight stop paused until the takeover tare is confirmed");
+      }
     }
   }
 
@@ -416,10 +546,22 @@ void scaleConnected_task(){
   //Max duration reached
   else if(!TIMER_ONLY 
   && shot.brewing 
-  && shot.shotTimer > MAX_SHOT_DURATION_S ){
+  && shotElapsed_s() > MAX_SHOT_DURATION_S ){
     shot.brewing = false;
     Serial.println("Max brew duration reached");
     shot.end = ENDTYPE::TIME;
+    setBrewingState(shot.brewing);
+  }
+
+  // Takeover tare never confirmed: the weight reference cannot be trusted.
+  else if(shot.brewing
+  && tareSuspect
+  && millis() - tareRetry_ms > TARE_CONFIRM_TIMEOUT_MS){
+    shot.brewing = false;
+    Serial.print("tare not confirmed, stopping shot at ");
+    Serial.print(currentWeight);
+    Serial.println("g");
+    shot.end = ENDTYPE::TARE_FAULT;
     setBrewingState(shot.brewing);
   }
 
@@ -444,6 +586,8 @@ void scaleConnected_task(){
 
   //Detect error of shot
   if(!TIMER_ONLY
+  && !shot.brewing
+  && shotLearnable
   && shot.start_timestamp_s
   && shot.end_s
   && currentWeight >= (goalWeight - weightOffset)

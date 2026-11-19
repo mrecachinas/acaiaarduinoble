@@ -15,9 +15,15 @@ This is an Arduino Library which can be found in the Arduino IDE Library Manager
 | Bookoo | Themis Ultra  | ----                 | ----   | Great | Yes | Yes | Yes 
 | Felicita | Arc   | ----                       | ----   | ---- | Yes | Yes | Yes 
 
+Note on the Lunar USB-C (2021): upstream captures show that scale messages can be split across BLE notifications. Older versions of this library dropped weight messages that did not arrive in a single supported notification, which can stall weight-dependent shot timing. "New"-protocol scales are now parsed as a reassembled byte stream with checksum validation and resynchronization after invalid frames. A weight bundled after command acknowledgements in the same event message is decoded too; unknown sub-events are skipped rather than guessed. Commands are spaced `CMD_SPACING_MS` apart as a precaution against back-to-back command loss. These are protective measures, not a confirmed explanation for every intermittent missing beep.
+
+New-protocol connections time out if no valid weight arrives within `MAX_PACKET_PERIOD_MS` (5 seconds), including after initial connection. Other scale types retain their existing first-weight behavior. Pending valid weights are processed before deciding that a connection timed out.
+
 
 ## Requirements
 This library is intended to be used with any arduino device which is compatible with the [ArduinoBLE](https://www.arduino.cc/reference/en/libraries/arduinoble/) library.
+
+ShotStopper firmware from this branch was validated on an ESP32-C3 ShotStopper built with **ESP32 Arduino core 3.3.3** (the core used for the v3.3.0 release) and ArduinoBLE 2.1.0. The same source built with core 3.3.12 crashed inside `BLE.begin()` (`esp_bt_controller_init`) and boot-looped on that board after an app-only flash; the cause has not been determined. Use core 3.3.3 until a newer core is verified on your hardware.
 
 ## Printed Circuit Board
 ![shotStopperV3 screenshot](https://github.com/user-attachments/assets/a09fe8fb-3705-44c0-88a2-07c61d67b8f6)
@@ -59,11 +65,31 @@ The following variables at the top of the shotStopper.ino file can be configured
 * true if a reed switch on the brew solenoid is being used to determine the brew state. This is typically not necessary so set to FALSE by default. This feature is only available for non-momentary-switches.
 
 `AUTOTARE`
-* true by default. The scale will automatically tare when the shot is started, and, if MOMENTARY is false, will perform another tare at 3 seconds to notify the user that the switch is latched and should be returned to the home position.
+* true by default. The scale will automatically tare when the shot is started, and, if MOMENTARY is false, will perform another tare when the switch latches to notify the user to return it to the home position.
 * if set to false, the shotStopper will never send a tare command. It is the user's responsibility to tare before each shot. This may be helpful if the scale is not stable when the shot begins, and thus the scale is unable to tare reliably.
 
 `TIMER_ONLY`
 * false by default. disables brew-by-weight functionality and enables only automatic timer and tare
+
+For latching paddles, takeover requires more than `MIN_SHOT_DURATION_S` (3 seconds) of elapsed time, the paddle still being on, and a valid weight received within `WEIGHT_FRESH_MS` (1 second). Stale data delays takeover and prints a warning once per shot; the paddle remains in manual control. If fresh weights resume while the paddle is still on and the maximum shot duration has not elapsed, takeover and its tare beep occur then. A beep is a tare command, not an acknowledgment that the scale executed it.
+
+On Acaia scales the takeover beep is a tare, so earlier measurements and predictions are discarded at takeover. If the reading at takeover is already at the stop threshold (`goal - offset`), the shot-start tare is assumed to have failed: weight stopping is paused until `TARE_CONFIRM_SAMPLES` fresh readings within `TARE_CONFIRM_BAND_G` of 0 g confirm the takeover tare. If that does not happen within `TARE_CONFIRM_TIMEOUT_MS` (1.5 seconds), the shot ends with a tare fault: the output is released, nothing is learned from it, and the paddle must be released before the next shot. The controller never retares later in the shot. A tare fault ends the shot shortly after takeover; restart it after checking the scale.
+
+The `MAX_SHOT_DURATION_S` (50 seconds) limit uses elapsed time independently of weight updates. Machine-control output changes happen before Bluetooth timer-stop commands, and a disconnect releases a latched output before any reconnect attempt. Scales occasionally ignore a timer stop, so the stop is resent once `STOP_TIMER_RESEND_MS` (1 second) later unless a new shot has started. Once latched, the paddle no longer stops the shot; keep an independent machine shutoff accessible during supervised testing.
+
+If a latching shot ends by time, weight, tare fault or scale disconnect, before or after takeover, the controller waits for a genuine debounced paddle release before accepting another start. Holding the paddle on, reconnecting, or receiving fresh weights later cannot restart the timer, tare again, or trigger another takeover. Before takeover the machine remains under manual paddle control while waiting; after takeover the output has already been released. The ended shot stops collecting measurements. The temporary reed-switch ignore window does not count as a release.
+
+The learned offset is updated only after a shot that ended by weight; purges, paddle stops, time limits, tare faults and disconnects say nothing about overshoot and are not learned from.
+
+## Validation
+
+Run the host regression suite with `python3 tests/run.py`. It requires a C++17 compiler with AddressSanitizer and UndefinedBehaviorSanitizer support; it does not access Bluetooth or machine hardware. Set `CXX` to select a compiler.
+
+For hardware verification, first record the original firmware's serial output during normal use until the intermittent failure occurs. Correlate weights, `Button Latched`, and `beep write successful` with the audible beeps; a successful write alone does not confirm command execution. Identify the actual controller board and preserve its existing firmware/recovery procedure before flashing a candidate build. Compare the same conditions on the controller, including cold connections, idle periods, consecutive starts, missing initial data, and disconnects after takeover, using supervised water-only runs and an independent way to stop the machine. A disconnect during an active shot releases the output; reconnecting with the paddle still on does not start another shot until the paddle is released. Record failures and final weight error against the baseline. Mac captures are useful parser fixtures, but cannot validate ArduinoBLE behavior or establish the original cause by themselves.
+
+The prebuilt files in `examples/shotStopper/build` are not regenerated by source changes or host tests. Build firmware for the identified board to include these fixes.
+
+These changes are incomplete reliability hardening, not a confirmed fix for every Lunar failure. Startup/command acceptance remains unresolved; see [the investigation](https://github.com/mrecachinas/acaiaarduinoble/issues/2). An ineffective shot-start tare is now detected only when the untared reading is at or above the stop threshold; a smaller untared reading relies on the takeover tare. Actual-controller validation is still required before recommending deployment.
 
 ## Demo
 
@@ -100,4 +126,3 @@ Felicita Arc support contributions from baettigp and A-TWJ
 Bookoo contributions from philgood and same31
 
 lunar 2019 contributions from jniebuhr
-
