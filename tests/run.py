@@ -12,11 +12,12 @@ sketch = (ROOT / "examples/shotStopper/shotStopper.ino").read_text()
 
 with tempfile.TemporaryDirectory(prefix="acaia-tests-") as directory:
     build = Path(directory)
-    for momentary, timer_only, reed in (
-        ("false", "false", "false"),
-        ("true", "false", "false"),
-        ("false", "true", "false"),
-        ("false", "false", "true"),
+    for momentary, timer_only, reed, bench in (
+        ("false", "false", "false", False),
+        ("true", "false", "false", False),
+        ("false", "true", "false", False),
+        ("false", "false", "true", False),
+        ("false", "false", "false", True),
     ):
         variant = sketch
         for name, value in (("MOMENTARY", momentary), ("TIMER_ONLY", timer_only),
@@ -31,6 +32,7 @@ with tempfile.TemporaryDirectory(prefix="acaia-tests-") as directory:
             compiler + [
                 "-std=c++17", "-g", "-fsanitize=address,undefined",
                 "-fno-omit-frame-pointer", "-DARDUINO_ESP32S3_DEV",
+                "-DSHOTSTOPPER_BENCH=" + ("1" if bench else "0"),
                 '-DSHOTSTOPPER_SKETCH="' + str(source) + '"',
                 "-I" + str(ROOT / "tests/stubs"), "-I" + str(ROOT),
                 str(ROOT / "tests/regression.cpp"), "-o", str(executable),
@@ -38,6 +40,6 @@ with tempfile.TemporaryDirectory(prefix="acaia-tests-") as directory:
             check=True,
             timeout=120,
         )
-        print("MOMENTARY={}, TIMER_ONLY={}, REEDSWITCH={}".format(
-            momentary, timer_only, reed), flush=True)
+        print("MOMENTARY={}, TIMER_ONLY={}, REEDSWITCH={}{}".format(
+            momentary, timer_only, reed, ", SHOTSTOPPER_BENCH=1" if bench else ""), flush=True)
         subprocess.run([str(executable)], check=True, timeout=30)
