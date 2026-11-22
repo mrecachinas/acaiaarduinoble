@@ -38,7 +38,15 @@ inline void setCpuFrequencyMhz(int) {}
 
 struct SerialMock {
     std::string output;
+    std::string input;
     void begin(int) {}
+    int available() const { return static_cast<int>(input.size()); }
+    int read() {
+        if (input.empty()) return -1;
+        int c = static_cast<unsigned char>(input.front());
+        input.erase(input.begin());
+        return c;
+    }
     template<class T> void print(const T& value) {
         std::ostringstream text;
         text << value;

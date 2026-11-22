@@ -61,6 +61,13 @@
 #define TIMER_ONLY false      // disables brew by weight functionality, and only automates the timer/tare
 //***************
 
+// Bench testing only (see tools/bench). Build with -DSHOTSTOPPER_BENCH=1 to replace the
+// paddle input with serial commands, allow tare fault injection and disable EEPROM writes.
+// A bench build ignores the real paddle: never install one in a machine.
+#ifndef SHOTSTOPPER_BENCH
+#define SHOTSTOPPER_BENCH 0
+#endif
+
 // Board Hardware 
 #ifdef ARDUINO_ESP32S3_DEV
   #define LED_RED     46
@@ -145,9 +152,68 @@ Shot shot = {0,0,0,0,{},{},0,false,ENDTYPE::UNDEF};
 BLEService weightService("0x0FFE"); // create service
 BLEByteCharacteristic weightCharacteristic("0xFF11",  BLEWrite | BLERead);
 
+#if SHOTSTOPPER_BENCH
+bool benchPaddle = false;
+bool benchSkipInitialTare = false;
+bool benchSkipTakeoverTare = false;
+
+// Serial commands: 1/0 paddle on/off; n normal tares; a skip the shot-start tare;
+// b skip both the shot-start and takeover tares.
+void benchPollSerial(){
+  while(Serial.available()){
+    int c = Serial.read();
+    if(c == '1' || c == '0'){
+      benchPaddle = (c == '1');
+      Serial.print("BENCH paddle ");
+      Serial.println(benchPaddle ? "ON" : "OFF");
+    }else if(c == 'n' || c == 'a' || c == 'b'){
+      benchSkipInitialTare = (c != 'n');
+      benchSkipTakeoverTare = (c == 'b');
+      Serial.print("BENCH mode: ");
+      Serial.println(c == 'n' ? "normal tares" : c == 'a' ? "skip initial tare"
+                                                         : "skip initial and takeover tares");
+    }
+  }
+}
+#endif
+
+int readPaddle(){
+#if SHOTSTOPPER_BENCH
+  return benchPaddle;
+#else
+  return !digitalRead(in); //Active Low
+#endif
+}
+
+// Fault injection for bench builds; always false otherwise.
+bool benchSuppressTare(bool takeover){
+#if SHOTSTOPPER_BENCH
+  if(takeover ? benchSkipTakeoverTare : benchSkipInitialTare){
+    Serial.println(takeover ? "BENCH: takeover tare suppressed" : "BENCH: initial tare suppressed");
+    return true;
+  }
+#endif
+  return false;
+}
+
+void saveSetting(int address, uint8_t value){
+#if SHOTSTOPPER_BENCH
+  Serial.print("BENCH: EEPROM write skipped, address ");
+  Serial.print(address);
+  Serial.print(" value ");
+  Serial.println(value);
+#else
+  EEPROM.write(address, value); //1 byte, 0-255
+  EEPROM.commit();
+#endif
+}
+
 void setup() {
   setCpuFrequencyMhz(80);
   Serial.begin(9600);
+#if SHOTSTOPPER_BENCH
+  Serial.println("BENCH TEST BUILD: paddle via serial 1/0, tare faults n/a/b, EEPROM writes disabled");
+#endif
   EEPROM.begin(EEPROM_SIZE);
 
   // Get stored setpoint and offset
@@ -191,6 +257,9 @@ void setup() {
 }
 
 void loop() {
+#if SHOTSTOPPER_BENCH
+  benchPollSerial();
+#endif
 
   if(scale.isConnected()){
     scaleConnected_task();
@@ -232,12 +301,13 @@ void setBrewingState(bool brewing){
     tareConfirmSamples = 0;
     shotLearnable = false;
     stopTimerResendPending = false; // must not stop the new shot's timer
-    if (CAN_TARE_START_TIMER && AUTOTARE) {
+    bool tareNow = AUTOTARE && !benchSuppressTare(false);
+    if (CAN_TARE_START_TIMER && tareNow) {
       scale.tareStartTimer();
     } else {
       scale.resetTimer();
       scale.startTimer();
-      if(AUTOTARE){
+      if(tareNow){
         scale.tare();
       }
     }
@@ -367,8 +437,7 @@ void scaleConnected_task(){
     Serial.print(" to ");
     goalWeight = weightCharacteristic.value();
     Serial.println(goalWeight);
-    EEPROM.write(WEIGHT_ADDR, goalWeight); //1 byte, 0-255
-    EEPROM.commit();
+    saveSetting(WEIGHT_ADDR, goalWeight);
   }
 
   // Send a heartbeat message to the scale periodically to maintain connection
@@ -444,7 +513,7 @@ void scaleConnected_task(){
     for(int i = BUTTON_STATE_ARRAY_LENGTH - 2;i>=0;i--){
       buttonArr[i+1] = buttonArr[i];
     }
-    buttonArr[0] = !digitalRead(in); //Active Low
+    buttonArr[0] = readPaddle();
 
     //only return 1 if contains 1
     // Also assume the button is off for a few milliseconds
@@ -510,7 +579,9 @@ void scaleConnected_task(){
     if(AUTOTARE){
       // A reading already at the stop threshold means the shot-start tare did not take.
       bool suspect = scale.beepTares() && currentWeight >= (goalWeight - weightOffset);
-      scale.beep();
+      if(!benchSuppressTare(true)){
+        scale.beep();
+      }
       if(scale.beepTares()){
         // The beep is an Acaia tare: earlier points and predictions use the old reference.
         shot.datapoints = 0;
@@ -610,8 +681,7 @@ void scaleConnected_task(){
       weightOffset += currentWeight - goalWeight;
       Serial.print(weightOffset);
 
-      EEPROM.write(OFFSET_ADDR, weightOffset*10); //1 byte, 0-255
-      EEPROM.commit();
+      saveSetting(OFFSET_ADDR, weightOffset*10);
     }
     Serial.println();
   }

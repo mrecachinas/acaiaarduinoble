@@ -773,6 +773,51 @@ void heldPaddleCompletionTests() {
     std::puts("held-paddle completion, genuine release and re-arming across legacy scales: PASS");
 }
 
+#if SHOTSTOPPER_BENCH
+// Bench builds: the virtual paddle replaces the real input, tare faults can be
+// injected, and nothing is written to EEPROM.
+void benchModeTests() {
+    reset();
+    buttonPressed = false;
+    shot.brewing = false;
+    benchPaddle = false;
+    std::fill(std::begin(buttonArr), std::end(buttonArr), 0);
+    newButtonState = 0;
+    mock::inputs[in] = LOW; // real paddle "on" must be ignored
+    auto start = millis();
+    runFor(start + 1000, 400);
+    assert(!shot.brewing && logCount("shot started") == 0);
+
+    // Skip both tares with a cup above the stop threshold: bounded tare fault.
+    Serial.input = "b1";
+    runFor(millis() + 6000, 400);
+    assert(logCount("BENCH mode: skip initial and takeover tares") == 1);
+    assert(logCount("BENCH: initial tare suppressed") == 1);
+    assert(logCount("BENCH: takeover tare suppressed") == 1);
+    assert(logCount("ShotEnded by tare fault") == 1 && tares() == 0);
+    assert(!shot.brewing && mock::outputs[OUT] == LOW);
+
+    // Release, normal tares, press again: a normal start with its tare.
+    Serial.input = "0";
+    for (int i = 0; i < BUTTON_STATE_ARRAY_LENGTH * 3; ++i) {
+        mock::now += BUTTON_READ_PERIOD_MS + 1;
+        loop();
+    }
+    Serial.input = "n1";
+    runFor(millis() + 500, 0);
+    assert(shot.brewing && logCount("shot started") == 2 && tares() == 1);
+
+    saveSetting(OFFSET_ADDR, 20);
+    assert(EEPROM.writes == 0 && EEPROM.commits == 0);
+    assert(logCount("BENCH: EEPROM write skipped") == 1);
+    std::puts("bench build: virtual paddle, tare fault injection, no EEPROM writes: PASS");
+}
+
+int main() {
+    std::setbuf(stdout, nullptr);
+    benchModeTests();
+}
+#else
 int main() {
     std::setbuf(stdout, nullptr);
     parserTests();
@@ -788,3 +833,4 @@ int main() {
     stopTimerResendTests();
     heldPaddleCompletionTests();
 }
+#endif
